@@ -2,68 +2,61 @@
 RoadGuard Infrastructure Intelligence
 ======================================
 
-Severity & Risk Decision Engine
+Computer Vision inference system for road damage detection.
 
-This module converts computer-vision detections into
-interpretable road-damage severity and priority information.
+Model:
+    YOLOv8n trained on RDD2022
 
-INPUT
------
-A YOLO detection containing:
+Supported inputs:
+    - Single image
+    - Folder of images
+    - Video
+    - Webcam
 
-    - damage type
-    - confidence
-    - bounding box
-    - image dimensions
+Outputs:
+    - Annotated images/video
+    - Damage detections
+    - Confidence scores
+    - Estimated severity
+    - Risk score
+    - Priority level
+    - JSON report
 
-OUTPUT
-------
-    - damage severity
-    - damage area
-    - damage risk score
-    - priority
-    - recommendation
-    - overall road risk
-    - overall road priority
+IMPORTANT:
+    Risk/severity are engineered decision-support scores.
+    They are NOT ground-truth labels from RDD2022.
 
-IMPORTANT
----------
-This is an ENGINEERED decision-support system.
-
-The RDD2022 dataset provides road-damage annotations,
-but it does NOT directly provide real-world repair urgency
-or accident-risk labels.
-
-Therefore, RoadGuard's severity and risk values are
-transparent heuristic estimates, not probabilities of
-an accident or guaranteed maintenance requirements.
-
-Author:
-    RoadGuard Team
+Author: RoadGuard Team
 """
-
 
 from __future__ import annotations
 
+import argparse
 import json
-import math
-from dataclasses import dataclass, asdict
+import sys
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Tuple, Optional
+
+import cv2
+import numpy as np
+
+try:
+    from ultralytics import YOLO
+except ImportError:
+    print("ERROR: Ultralytics is not installed.")
+    print("Run: pip install ultralytics")
+    sys.exit(1)
 
 
 # ============================================================
-# VERSION
+# CONFIGURATION
 # ============================================================
 
-SEVERITY_ENGINE_VERSION = "1.0.0"
+DEFAULT_MODEL = "models/roadguard_best.pt"
 
-
-# ============================================================
-# ROAD DAMAGE CLASSES
-# ============================================================
-
-CLASS_NAMES: Dict[int, str] = {
+# RDD2022 classes used during training.
+CLASS_NAMES = {
     0: "Longitudinal Crack",
     1: "Transverse Crack",
     2: "Alligator Crack",
@@ -72,1941 +65,1422 @@ CLASS_NAMES: Dict[int, str] = {
 }
 
 
-# ============================================================
-# DAMAGE WEIGHTS
-# ============================================================
-#
-# These are engineering assumptions used by RoadGuard.
-#
-# They are NOT learned from another dataset.
-#
-# Higher value = greater contribution to the risk score.
-#
-# Potholes receive a higher value because they represent
-# a different type of physical road defect than cracks.
-#
-# These values should be described in your project report
-# as "engineered class weights".
-# ============================================================
-
-DAMAGE_WEIGHTS: Dict[str, float] = {
-
+# These are engineered weights for RoadGuard's
+# decision-support score. They are NOT learned labels.
+DAMAGE_WEIGHTS = {
     "Longitudinal Crack": 0.70,
-
     "Transverse Crack": 0.65,
-
     "Alligator Crack": 0.85,
-
     "Other Corruption": 0.50,
-
     "Pothole": 1.00,
 }
 
 
 # ============================================================
-# SCORING CONFIGURATION
+# ROADGUARD ENGINE
 # ============================================================
 
-@dataclass(frozen=True)
-class SeverityConfig:
+class RoadGuard:
     """
-    Configuration for RoadGuard's severity engine.
+    Main RoadGuard inference engine.
 
-    The weights must add up to 1.0 for each scoring system.
-    """
-
-    # --------------------------------------------------------
-    # Risk score weights
-    # --------------------------------------------------------
-
-    risk_damage_weight: float = 0.45
-
-    risk_confidence_weight: float = 0.30
-
-    risk_area_weight: float = 0.25
-
-    # --------------------------------------------------------
-    # Severity score weights
-    # --------------------------------------------------------
-
-    severity_area_weight: float = 0.70
-
-    severity_confidence_weight: float = 0.30
-
-    # --------------------------------------------------------
-    # Risk thresholds
-    # --------------------------------------------------------
-
-    high_risk_threshold: float = 70.0
-
-    medium_risk_threshold: float = 40.0
-
-    # --------------------------------------------------------
-    # Severity thresholds
-    # --------------------------------------------------------
-
-    high_severity_threshold: float = 60.0
-
-    medium_severity_threshold: float = 30.0
-
-    # --------------------------------------------------------
-    # Minimum confidence used by the decision engine
-    # --------------------------------------------------------
-
-    minimum_confidence: float = 0.0
-
-    # --------------------------------------------------------
-    # Area normalization
-    #
-    # A bounding box covering approximately 10% of the
-    # image is treated as a strong visible-area signal.
-    #
-    # This does NOT mean 10% physical road damage.
-    # It only refers to the detected bounding-box area
-    # relative to the image.
-    # --------------------------------------------------------
-
-    area_reference_ratio: float = 0.10
-
-
-DEFAULT_CONFIG = SeverityConfig()
-
-
-# ============================================================
-# VALIDATION HELPERS
-# ============================================================
-
-def _clamp(
-    value: float,
-    minimum: float = 0.0,
-    maximum: float = 100.0,
-) -> float:
-    """
-    Clamp a number to a specified range.
+    Responsibilities:
+        1. Load YOLO model
+        2. Run object detection
+        3. Calculate damage area
+        4. Estimate severity
+        5. Calculate risk score
+        6. Determine priority
+        7. Produce annotated output
+        8. Generate JSON reports
     """
 
-    return max(
-        minimum,
-        min(
-            maximum,
-            float(value),
-        ),
-    )
-
-
-def _safe_float(
-    value: Any,
-    default: float = 0.0,
-) -> float:
-    """
-    Safely convert a value to float.
-    """
-
-    try:
-        result = float(value)
-
-        if math.isnan(result):
-            return default
-
-        if math.isinf(result):
-            return default
-
-        return result
-
-    except (
-        TypeError,
-        ValueError,
+    def __init__(
+        self,
+        model_path: str = DEFAULT_MODEL,
+        confidence: float = 0.25,
+        iou: float = 0.45,
+        image_size: int = 640,
+        device: Optional[str] = None,
     ):
-        return default
+        self.model_path = Path(model_path)
+        self.confidence = confidence
+        self.iou = iou
+        self.image_size = image_size
+        self.device = device
 
+        if not self.model_path.exists():
+            raise FileNotFoundError(
+                f"\nModel not found:\n{self.model_path}\n\n"
+                "Make sure roadguard_best.pt exists in:\n"
+                "models/roadguard_best.pt"
+            )
 
-def validate_config(
-    config: SeverityConfig,
-) -> None:
-    """
-    Validate scoring configuration.
-    """
+        print("=" * 60)
+        print("ROADGUARD INITIALIZATION")
+        print("=" * 60)
+        print(f"Model:      {self.model_path}")
+        print(f"Confidence: {self.confidence}")
+        print(f"IoU:        {self.iou}")
+        print(f"Image size: {self.image_size}")
+        print(f"Device:     {self.device or 'Auto'}")
+        print("=" * 60)
 
-    risk_total = (
-        config.risk_damage_weight
-        + config.risk_confidence_weight
-        + config.risk_area_weight
-    )
+        self.model = YOLO(str(self.model_path))
 
-    severity_total = (
-        config.severity_area_weight
-        + config.severity_confidence_weight
-    )
+        print("Model loaded successfully.\n")
 
-    if not math.isclose(
-        risk_total,
-        1.0,
-        abs_tol=1e-6,
-    ):
-        raise ValueError(
-            "Risk weights must sum to 1.0. "
-            f"Current total: {risk_total}"
+    # --------------------------------------------------------
+    # DAMAGE AREA
+    # --------------------------------------------------------
+
+    @staticmethod
+    def calculate_area_ratio(
+        x1: float,
+        y1: float,
+        x2: float,
+        y2: float,
+        image_width: int,
+        image_height: int,
+    ) -> float:
+        """
+        Calculate the percentage of the image covered
+        by a detection bounding box.
+        """
+
+        box_width = max(0.0, x2 - x1)
+        box_height = max(0.0, y2 - y1)
+
+        box_area = box_width * box_height
+        image_area = max(
+            1.0,
+            float(image_width * image_height)
         )
 
-    if not math.isclose(
-        severity_total,
-        1.0,
-        abs_tol=1e-6,
-    ):
-        raise ValueError(
-            "Severity weights must sum to 1.0. "
-            f"Current total: {severity_total}"
+        return float(box_area / image_area)
+
+    # --------------------------------------------------------
+    # SEVERITY
+    # --------------------------------------------------------
+
+    @staticmethod
+    def calculate_severity(
+        area_ratio: float,
+        confidence: float,
+    ) -> str:
+        """
+        Estimate severity from visible damage extent
+        and model confidence.
+
+        This is an engineered estimate.
+        """
+
+        # Convert area ratio into a 0-100 scale.
+        #
+        # We cap the contribution so a very large
+        # detection does not dominate the entire score.
+        area_score = min(area_ratio * 100.0, 100.0)
+
+        severity_signal = (
+            0.70 * area_score +
+            0.30 * (confidence * 100.0)
         )
 
-    if not (
-        0.0 <=
-        config.high_risk_threshold <=
-        100.0
-    ):
-        raise ValueError(
-            "high_risk_threshold must be between 0 and 100."
-        )
-
-    if not (
-        0.0 <=
-        config.medium_risk_threshold <=
-        100.0
-    ):
-        raise ValueError(
-            "medium_risk_threshold must be between 0 and 100."
-        )
-
-    if (
-        config.medium_risk_threshold
-        >=
-        config.high_risk_threshold
-    ):
-        raise ValueError(
-            "Medium risk threshold must be lower "
-            "than high risk threshold."
-        )
-
-    if not (
-        0.0 <
-        config.area_reference_ratio <=
-        1.0
-    ):
-        raise ValueError(
-            "area_reference_ratio must be > 0 and <= 1."
-        )
-
-
-# Validate the default configuration when the module loads.
-validate_config(DEFAULT_CONFIG)
-
-
-# ============================================================
-# BOUNDING BOX UTILITIES
-# ============================================================
-
-def normalize_box(
-    box: Sequence[float],
-) -> Tuple[float, float, float, float]:
-    """
-    Normalize a bounding box into:
-
-        x1, y1, x2, y2
-
-    Parameters
-    ----------
-    box:
-        Four numerical values.
-
-    Returns
-    -------
-    Tuple[float, float, float, float]
-    """
-
-    if len(box) != 4:
-        raise ValueError(
-            "Bounding box must contain exactly "
-            "four values: x1, y1, x2, y2."
-        )
-
-    x1 = _safe_float(box[0])
-    y1 = _safe_float(box[1])
-    x2 = _safe_float(box[2])
-    y2 = _safe_float(box[3])
-
-    # Make sure coordinates are ordered.
-    if x2 < x1:
-        x1, x2 = x2, x1
-
-    if y2 < y1:
-        y1, y2 = y2, y1
-
-    return (
-        x1,
-        y1,
-        x2,
-        y2,
-    )
-
-
-def bounding_box_area(
-    box: Sequence[float],
-) -> float:
-    """
-    Calculate bounding-box area in pixels.
-    """
-
-    x1, y1, x2, y2 = normalize_box(box)
-
-    width = max(
-        0.0,
-        x2 - x1,
-    )
-
-    height = max(
-        0.0,
-        y2 - y1,
-    )
-
-    return width * height
-
-
-def bounding_box_center(
-    box: Sequence[float],
-) -> Tuple[float, float]:
-    """
-    Calculate center point of a bounding box.
-    """
-
-    x1, y1, x2, y2 = normalize_box(box)
-
-    return (
-        (x1 + x2) / 2.0,
-        (y1 + y2) / 2.0,
-    )
-
-
-def bounding_box_dimensions(
-    box: Sequence[float],
-) -> Tuple[float, float]:
-    """
-    Return bounding-box width and height.
-    """
-
-    x1, y1, x2, y2 = normalize_box(box)
-
-    return (
-        max(0.0, x2 - x1),
-        max(0.0, y2 - y1),
-    )
-
-
-# ============================================================
-# IMAGE AREA
-# ============================================================
-
-def image_area(
-    image_width: float,
-    image_height: float,
-) -> float:
-    """
-    Calculate image area.
-    """
-
-    width = max(
-        1.0,
-        _safe_float(image_width),
-    )
-
-    height = max(
-        1.0,
-        _safe_float(image_height),
-    )
-
-    return width * height
-
-
-# ============================================================
-# DAMAGE AREA RATIO
-# ============================================================
-
-def calculate_area_ratio(
-    box: Sequence[float],
-    image_width: float,
-    image_height: float,
-) -> float:
-    """
-    Calculate the detected bounding-box area as a fraction
-    of the entire image.
-
-    Example:
-
-        0.05 = 5% of image area
-    """
-
-    box_area = bounding_box_area(
-        box
-    )
-
-    total_area = image_area(
-        image_width,
-        image_height,
-    )
-
-    return _clamp(
-        box_area / total_area,
-        0.0,
-        1.0,
-    )
-
-
-def calculate_area_percentage(
-    area_ratio: float,
-) -> float:
-    """
-    Convert area ratio to percentage.
-
-    Example:
-
-        0.05 -> 5.0
-    """
-
-    return round(
-        _clamp(area_ratio, 0.0, 1.0) * 100.0,
-        3,
-    )
-
-
-# ============================================================
-# NORMALIZED AREA SCORE
-# ============================================================
-
-def calculate_area_score(
-    area_ratio: float,
-    config: SeverityConfig = DEFAULT_CONFIG,
-) -> float:
-    """
-    Convert bounding-box area ratio into a 0-100 score.
-
-    The area reference ratio controls how quickly the score
-    approaches 100.
-
-    Example with reference ratio = 0.10:
-
-        0.01 -> 10
-        0.05 -> 50
-        0.10 -> 100
-
-    This is an engineered normalization, not a physical
-    measurement of actual damage depth or road deterioration.
-    """
-
-    area_ratio = _clamp(
-        area_ratio,
-        0.0,
-        1.0,
-    )
-
-    reference = max(
-        config.area_reference_ratio,
-        1e-9,
-    )
-
-    score = (
-        area_ratio /
-        reference
-    ) * 100.0
-
-    return round(
-        _clamp(score),
-        3,
-    )
-
-
-# ============================================================
-# CONFIDENCE SCORE
-# ============================================================
-
-def calculate_confidence_score(
-    confidence: float,
-) -> float:
-    """
-    Convert YOLO confidence from:
-
-        0.0 - 1.0
-
-    to:
-
-        0 - 100
-    """
-
-    confidence = _clamp(
-        _safe_float(confidence),
-        0.0,
-        1.0,
-    )
-
-    return round(
-        confidence * 100.0,
-        3,
-    )
-
-
-# ============================================================
-# DAMAGE CLASS SCORE
-# ============================================================
-
-def get_damage_weight(
-    damage_name: str,
-) -> float:
-    """
-    Return engineered importance weight for a damage class.
-    """
-
-    return DAMAGE_WEIGHTS.get(
-        damage_name,
-        0.50,
-    )
-
-
-def get_damage_class_score(
-    damage_name: str,
-) -> float:
-    """
-    Convert damage weight into 0-100 score.
-    """
-
-    return round(
-        get_damage_weight(
-            damage_name
-        ) * 100.0,
-        3,
-    )
-
-
-# ============================================================
-# SEVERITY SCORE
-# ============================================================
-
-def calculate_severity_score(
-    area_ratio: float,
-    confidence: float,
-    config: SeverityConfig = DEFAULT_CONFIG,
-) -> float:
-    """
-    Calculate a 0-100 engineered severity score.
-
-    Components:
-
-        70% visible-area signal
-        30% model-confidence signal
-
-    Note:
-        This is not a ground-truth severity measurement.
-    """
-
-    area_score = calculate_area_score(
-        area_ratio,
-        config,
-    )
-
-    confidence_score = calculate_confidence_score(
-        confidence
-    )
-
-    score = (
-        config.severity_area_weight
-        * area_score
-        +
-        config.severity_confidence_weight
-        * confidence_score
-    )
-
-    return round(
-        _clamp(score),
-        2,
-    )
-
-
-# ============================================================
-# SEVERITY LABEL
-# ============================================================
-
-def severity_label(
-    severity_score: float,
-    config: SeverityConfig = DEFAULT_CONFIG,
-) -> str:
-    """
-    Convert severity score to:
-
-        LOW
-        MEDIUM
-        HIGH
-    """
-
-    score = _clamp(
-        severity_score
-    )
-
-    if (
-        score >=
-        config.high_severity_threshold
-    ):
-        return "HIGH"
-
-    if (
-        score >=
-        config.medium_severity_threshold
-    ):
-        return "MEDIUM"
-
-    return "LOW"
-
-
-# ============================================================
-# RISK SCORE
-# ============================================================
-
-def calculate_risk_score(
-    damage_name: str,
-    confidence: float,
-    area_ratio: float,
-    config: SeverityConfig = DEFAULT_CONFIG,
-) -> float:
-    """
-    Calculate RoadGuard's 0-100 engineered risk score.
-
-    Formula:
-
-        Risk =
+        if severity_signal >= 60:
+            return "HIGH"
+
+        if severity_signal >= 30:
+            return "MEDIUM"
+
+        return "LOW"
+
+    # --------------------------------------------------------
+    # RISK SCORE
+    # --------------------------------------------------------
+
+    @staticmethod
+    def calculate_risk_score(
+        damage_name: str,
+        confidence: float,
+        area_ratio: float,
+    ) -> float:
+        """
+        Calculate RoadGuard's engineered 0-100 risk score.
+
+        Components:
             45% damage type
-          + 30% confidence
-          + 25% visible area
+            30% model confidence
+            25% visible area
 
-    This should NOT be described as:
-        "87% chance of an accident"
+        NOTE:
+            This is NOT a medically/statistically validated
+            risk probability.
+        """
 
-    Instead describe it as:
-        "RoadGuard risk score: 87/100"
+        damage_weight = DAMAGE_WEIGHTS.get(
+            damage_name,
+            0.50
+        )
 
-    It is a prioritization signal.
-    """
+        damage_score = damage_weight * 100.0
 
-    damage_score = get_damage_class_score(
-        damage_name
-    )
+        confidence_score = confidence * 100.0
 
-    confidence_score = calculate_confidence_score(
-        confidence
-    )
+        area_score = min(
+            area_ratio * 100.0,
+            100.0
+        )
 
-    area_score = calculate_area_score(
-        area_ratio,
-        config,
-    )
+        risk = (
+            0.45 * damage_score +
+            0.30 * confidence_score +
+            0.25 * area_score
+        )
 
-    risk = (
-        config.risk_damage_weight
-        * damage_score
-        +
-        config.risk_confidence_weight
-        * confidence_score
-        +
-        config.risk_area_weight
-        * area_score
-    )
+        return round(
+            float(np.clip(risk, 0.0, 100.0)),
+            2
+        )
 
-    return round(
-        _clamp(risk),
-        2,
-    )
+    # --------------------------------------------------------
+    # PRIORITY
+    # --------------------------------------------------------
 
+    @staticmethod
+    def get_priority(risk_score: float) -> str:
+        """
+        Convert risk score into an operational priority.
+        """
 
-# ============================================================
-# PRIORITY
-# ============================================================
+        if risk_score >= 70:
+            return "HIGH"
 
-def priority_label(
-    risk_score: float,
-    config: SeverityConfig = DEFAULT_CONFIG,
-) -> str:
-    """
-    Convert risk score to operational priority.
-    """
+        if risk_score >= 40:
+            return "MEDIUM"
 
-    score = _clamp(
-        risk_score
-    )
+        return "LOW"
 
-    if (
-        score >=
-        config.high_risk_threshold
-    ):
-        return "HIGH"
+    # --------------------------------------------------------
+    # RECOMMENDATION
+    # --------------------------------------------------------
 
-    if (
-        score >=
-        config.medium_risk_threshold
-    ):
-        return "MEDIUM"
+    @staticmethod
+    def get_recommendation(
+        damage_name: str,
+        priority: str,
+        severity: str,
+    ) -> str:
+        """
+        Generate a human-readable recommendation.
+        """
 
-    return "LOW"
-
-
-# ============================================================
-# PRIORITY LEVEL
-# ============================================================
-
-def priority_level(
-    priority: str,
-) -> int:
-    """
-    Convert priority label to a numerical level.
-
-        HIGH   = 3
-        MEDIUM = 2
-        LOW    = 1
-    """
-
-    mapping = {
-        "HIGH": 3,
-        "MEDIUM": 2,
-        "LOW": 1,
-    }
-
-    return mapping.get(
-        priority.upper(),
-        1,
-    )
-
-
-# ============================================================
-# RECOMMENDATION ENGINE
-# ============================================================
-
-def generate_recommendation(
-    damage_name: str,
-    severity: str,
-    risk_score: float,
-    priority: str,
-) -> str:
-    """
-    Generate an explainable maintenance recommendation.
-
-    These are recommendations for inspection/monitoring,
-    NOT guaranteed engineering instructions.
-    """
-
-    damage = damage_name.lower()
-
-    if priority == "HIGH":
-
-        if "pothole" in damage:
+        if priority == "HIGH":
             return (
-                "High-priority pothole detected. "
-                "Schedule prompt field inspection "
-                "and assess for maintenance."
+                "Immediate inspection recommended. "
+                "Consider prioritizing this damage for maintenance."
             )
 
-        if "alligator" in damage:
+        if priority == "MEDIUM":
             return (
-                "High-priority alligator cracking detected. "
-                "Schedule prompt field inspection "
-                "to assess pavement condition."
-            )
-
-        if "crack" in damage:
-            return (
-                "High-priority cracking detected. "
-                "Schedule prompt inspection and "
-                "evaluate the affected road section."
+                "Schedule inspection and monitor the "
+                "damage condition."
             )
 
         return (
-            "High-priority road damage detected. "
-            "Schedule prompt field inspection."
+            "Monitor the detected damage during "
+            "future road inspections."
         )
 
-    if priority == "MEDIUM":
+    # --------------------------------------------------------
+    # SINGLE IMAGE INFERENCE
+    # --------------------------------------------------------
 
-        if "pothole" in damage:
-            return (
-                "Moderate-priority pothole detected. "
-                "Schedule inspection and monitor progression."
+    def predict_image(
+        self,
+        image_path: str | Path,
+    ) -> Dict:
+
+        image_path = Path(image_path)
+
+        if not image_path.exists():
+            raise FileNotFoundError(
+                f"Input image not found: {image_path}"
             )
 
-        if "crack" in damage:
-            return (
-                "Moderate-priority cracking detected. "
-                "Schedule inspection and monitor progression."
+        image = cv2.imread(str(image_path))
+
+        if image is None:
+            raise ValueError(
+                f"Unable to read image: {image_path}"
             )
 
-        return (
-            "Moderate-priority road damage detected. "
-            "Schedule inspection and monitor condition."
+        height, width = image.shape[:2]
+
+        # Run YOLO
+        results = self.model.predict(
+            source=str(image_path),
+            conf=self.confidence,
+            iou=self.iou,
+            imgsz=self.image_size,
+            device=self.device,
+            verbose=False,
         )
 
-    # LOW
-
-    return (
-        "Low-priority visual damage detected. "
-        "Continue monitoring during future inspections."
-    )
-
-
-# ============================================================
-# EXPLANATION ENGINE
-# ============================================================
-
-def generate_explanation(
-    damage_name: str,
-    confidence: float,
-    area_ratio: float,
-    severity_score: float,
-    risk_score: float,
-    priority: str,
-) -> str:
-    """
-    Generate a human-readable explanation of the score.
-
-    This is useful for your dashboard and judges because
-    it makes the AI decision more interpretable.
-    """
-
-    area_percentage = (
-        calculate_area_percentage(
-            area_ratio
-        )
-    )
-
-    confidence_percentage = (
-        calculate_confidence_score(
-            confidence
-        )
-    )
-
-    return (
-        f"RoadGuard detected {damage_name} "
-        f"with {confidence_percentage:.1f}% model confidence. "
-        f"The detected bounding box covers approximately "
-        f"{area_percentage:.2f}% of the image. "
-        f"The engineered severity score is "
-        f"{severity_score:.1f}/100 and the engineered "
-        f"risk score is {risk_score:.1f}/100, "
-        f"resulting in {priority} priority."
-    )
-
-
-# ============================================================
-# SINGLE DETECTION ANALYSIS
-# ============================================================
-
-def analyze_detection(
-    damage_name: str,
-    confidence: float,
-    box: Sequence[float],
-    image_width: float,
-    image_height: float,
-    config: SeverityConfig = DEFAULT_CONFIG,
-    detection_id: Optional[int] = None,
-) -> Dict[str, Any]:
-    """
-    Analyze one YOLO detection.
-
-    This is the main function that inference.py can call.
-    """
-
-    validate_config(
-        config
-    )
-
-    confidence = _clamp(
-        _safe_float(confidence),
-        0.0,
-        1.0,
-    )
-
-    # --------------------------------------------------------
-    # Geometry
-    # --------------------------------------------------------
-
-    normalized_box = normalize_box(
-        box
-    )
-
-    width, height = bounding_box_dimensions(
-        normalized_box
-    )
-
-    box_area = bounding_box_area(
-        normalized_box
-    )
-
-    center_x, center_y = bounding_box_center(
-        normalized_box
-    )
-
-    # --------------------------------------------------------
-    # Area
-    # --------------------------------------------------------
-
-    area_ratio = calculate_area_ratio(
-        normalized_box,
-        image_width,
-        image_height,
-    )
-
-    area_percentage = calculate_area_percentage(
-        area_ratio
-    )
-
-    area_score = calculate_area_score(
-        area_ratio,
-        config,
-    )
-
-    # --------------------------------------------------------
-    # Confidence
-    # --------------------------------------------------------
-
-    confidence_score = calculate_confidence_score(
-        confidence
-    )
-
-    # --------------------------------------------------------
-    # Damage class
-    # --------------------------------------------------------
-
-    damage_weight = get_damage_weight(
-        damage_name
-    )
-
-    damage_class_score = get_damage_class_score(
-        damage_name
-    )
-
-    # --------------------------------------------------------
-    # Severity
-    # --------------------------------------------------------
-
-    severity_score = calculate_severity_score(
-        area_ratio=area_ratio,
-        confidence=confidence,
-        config=config,
-    )
-
-    severity = severity_label(
-        severity_score,
-        config,
-    )
-
-    # --------------------------------------------------------
-    # Risk
-    # --------------------------------------------------------
-
-    risk_score = calculate_risk_score(
-        damage_name=damage_name,
-        confidence=confidence,
-        area_ratio=area_ratio,
-        config=config,
-    )
-
-    # --------------------------------------------------------
-    # Priority
-    # --------------------------------------------------------
-
-    priority = priority_label(
-        risk_score,
-        config,
-    )
-
-    priority_numeric = priority_level(
-        priority
-    )
-
-    # --------------------------------------------------------
-    # Recommendation
-    # --------------------------------------------------------
-
-    recommendation = generate_recommendation(
-        damage_name=damage_name,
-        severity=severity,
-        risk_score=risk_score,
-        priority=priority,
-    )
-
-    # --------------------------------------------------------
-    # Explanation
-    # --------------------------------------------------------
-
-    explanation = generate_explanation(
-        damage_name=damage_name,
-        confidence=confidence,
-        area_ratio=area_ratio,
-        severity_score=severity_score,
-        risk_score=risk_score,
-        priority=priority,
-    )
-
-    # --------------------------------------------------------
-    # Final structured result
-    # --------------------------------------------------------
-
-    result = {
-        "id": detection_id,
-
-        "damage_type": damage_name,
-
-        "confidence": round(
-            confidence,
-            4,
-        ),
-
-        "confidence_percentage": round(
-            confidence_score,
-            2,
-        ),
-
-        "bounding_box": {
-            "x1": round(
-                normalized_box[0],
-                2,
-            ),
-            "y1": round(
-                normalized_box[1],
-                2,
-            ),
-            "x2": round(
-                normalized_box[2],
-                2,
-            ),
-            "y2": round(
-                normalized_box[3],
-                2,
-            ),
-        },
-
-        "geometry": {
-            "width_pixels": round(
-                width,
-                2,
-            ),
-            "height_pixels": round(
-                height,
-                2,
-            ),
-            "area_pixels": round(
-                box_area,
-                2,
-            ),
-            "center_x": round(
-                center_x,
-                2,
-            ),
-            "center_y": round(
-                center_y,
-                2,
-            ),
-        },
-
-        "image_dimensions": {
-            "width": int(
-                image_width
-            ),
-            "height": int(
-                image_height
-            ),
-        },
-
-        "damage_weight": round(
-            damage_weight,
-            3,
-        ),
-
-        "damage_class_score": round(
-            damage_class_score,
-            2,
-        ),
-
-        "area_ratio": round(
-            area_ratio,
-            5,
-        ),
-
-        "area_percentage": round(
-            area_percentage,
-            3,
-        ),
-
-        "area_score": round(
-            area_score,
-            2,
-        ),
-
-        "severity_score": round(
-            severity_score,
-            2,
-        ),
-
-        "severity": severity,
-
-        "risk_score": round(
-            risk_score,
-            2,
-        ),
-
-        "priority": priority,
-
-        "priority_level": priority_numeric,
-
-        "recommendation": recommendation,
-
-        "explanation": explanation,
-    }
-
-    return result
-
-
-# ============================================================
-# OVERALL ROAD ANALYSIS
-# ============================================================
-
-def analyze_detections(
-    detections: Iterable[Dict[str, Any]],
-    image_width: int,
-    image_height: int,
-    config: SeverityConfig = DEFAULT_CONFIG,
-) -> Dict[str, Any]:
-    """
-    Analyze multiple YOLO detections.
-
-    Expected input:
-
-        [
-            {
-                "damage_type": "Pothole",
-                "confidence": 0.91,
-                "bounding_box": {
-                    "x1": ...,
-                    "y1": ...,
-                    "x2": ...,
-                    "y2": ...
+        result = results[0]
+
+        detections: List[Dict] = []
+
+        if result.boxes is not None:
+
+            boxes = result.boxes
+
+            for index in range(len(boxes)):
+
+                cls_id = int(
+                    boxes.cls[index].item()
+                )
+
+                confidence = float(
+                    boxes.conf[index].item()
+                )
+
+                xyxy = boxes.xyxy[index].cpu().numpy()
+
+                x1, y1, x2, y2 = map(
+                    float,
+                    xyxy
+                )
+
+                damage_name = CLASS_NAMES.get(
+                    cls_id,
+                    f"Unknown Class {cls_id}"
+                )
+
+                area_ratio = self.calculate_area_ratio(
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    width,
+                    height,
+                )
+
+                severity = self.calculate_severity(
+                    area_ratio,
+                    confidence,
+                )
+
+                risk_score = self.calculate_risk_score(
+                    damage_name,
+                    confidence,
+                    area_ratio,
+                )
+
+                priority = self.get_priority(
+                    risk_score
+                )
+
+                recommendation = self.get_recommendation(
+                    damage_name,
+                    priority,
+                    severity,
+                )
+
+                detection = {
+                    "id": index + 1,
+                    "class_id": cls_id,
+                    "damage_type": damage_name,
+                    "confidence": round(
+                        confidence,
+                        4
+                    ),
+                    "bounding_box": {
+                        "x1": round(x1, 2),
+                        "y1": round(y1, 2),
+                        "x2": round(x2, 2),
+                        "y2": round(y2, 2),
+                    },
+                    "area_ratio": round(
+                        area_ratio,
+                        5
+                    ),
+                    "area_percentage": round(
+                        area_ratio * 100,
+                        3
+                    ),
+                    "severity": severity,
+                    "risk_score": risk_score,
+                    "priority": priority,
+                    "recommendation": recommendation,
                 }
-            }
-        ]
 
-    Returns a complete RoadGuard road-level analysis.
-    """
+                detections.append(detection)
 
-    validate_config(
-        config
-    )
+        # ----------------------------------------------------
+        # IMAGE-LEVEL SUMMARY
+        # ----------------------------------------------------
 
-    analyzed: List[Dict[str, Any]] = []
+        if detections:
 
-    for index, detection in enumerate(
-        detections,
-        start=1,
-    ):
+            highest_risk = max(
+                detections,
+                key=lambda x: x["risk_score"]
+            )
 
-        damage_name = detection.get(
-            "damage_type",
-            "Unknown",
-        )
+            overall_risk = max(
+                x["risk_score"]
+                for x in detections
+            )
 
-        confidence = detection.get(
-            "confidence",
-            0.0,
-        )
+            overall_priority = self.get_priority(
+                overall_risk
+            )
 
-        box_data = detection.get(
-            "bounding_box"
-        )
-
-        if box_data is None:
-            continue
-
-        if isinstance(
-            box_data,
-            dict,
-        ):
-
-            box = [
-                box_data.get("x1", 0),
-                box_data.get("y1", 0),
-                box_data.get("x2", 0),
-                box_data.get("y2", 0),
-            ]
+            damage_types = sorted(
+                set(
+                    x["damage_type"]
+                    for x in detections
+                )
+            )
 
         else:
 
-            box = box_data
+            highest_risk = None
+            overall_risk = 0.0
+            overall_priority = "LOW"
+            damage_types = []
 
-        result = analyze_detection(
-            damage_name=damage_name,
-            confidence=confidence,
-            box=box,
-            image_width=image_width,
-            image_height=image_height,
-            config=config,
-            detection_id=index,
-        )
-
-        analyzed.append(
-            result
-        )
-
-    # ========================================================
-    # NO DAMAGE
-    # ========================================================
-
-    if not analyzed:
+        report = {
+            "system": "RoadGuard Infrastructure Intelligence",
+            "timestamp": datetime.now().isoformat(),
+            "image": str(image_path),
+            "image_width": width,
+            "image_height": height,
+            "detections_count": len(detections),
+            "damage_types_detected": damage_types,
+            "overall_risk_score": round(
+                overall_risk,
+                2
+            ),
+            "overall_priority": overall_priority,
+            "highest_risk_detection": highest_risk,
+            "detections": detections,
+        }
 
         return {
-            "detections_count": 0,
-            "damage_types_detected": [],
-            "overall_risk_score": 0.0,
-            "overall_severity_score": 0.0,
-            "overall_severity": "LOW",
-            "overall_priority": "LOW",
-            "highest_risk_detection": None,
-            "highest_severity_detection": None,
-            "recommendation": (
-                "No road damage was detected. "
-                "Continue normal monitoring."
-            ),
-            "detections": [],
+            "report": report,
+            "result": result,
+            "original_image": image,
         }
 
-    # ========================================================
-    # HIGHEST RISK
-    # ========================================================
+    # --------------------------------------------------------
+    # DRAW PROFESSIONAL ROADGUARD OUTPUT
+    # --------------------------------------------------------
 
-    highest_risk = max(
-        analyzed,
-        key=lambda item: item["risk_score"],
-    )
+    def draw_results(
+        self,
+        inference_output: Dict,
+    ) -> np.ndarray:
 
-    highest_severity = max(
-        analyzed,
-        key=lambda item: item["severity_score"],
-    )
+        report = inference_output["report"]
+        image = inference_output[
+            "original_image"
+        ].copy()
 
-    # ========================================================
-    # OVERALL RISK
-    # ========================================================
-    #
-    # We use the highest individual risk as the primary
-    # road-level risk because one severe defect can warrant
-    # attention even when other defects are minor.
-    #
-    # We do NOT simply add scores because that could create
-    # an artificial score above 100.
-    # ========================================================
+        detections = report["detections"]
 
-    overall_risk = highest_risk[
-        "risk_score"
-    ]
+        # -----------------------------------------------
+        # Draw bounding boxes
+        # -----------------------------------------------
 
-    overall_severity_score = highest_severity[
-        "severity_score"
-    ]
+        for detection in detections:
 
-    overall_priority = priority_label(
-        overall_risk,
-        config,
-    )
+            box = detection["bounding_box"]
 
-    overall_severity = severity_label(
-        overall_severity_score,
-        config,
-    )
+            x1 = int(box["x1"])
+            y1 = int(box["y1"])
+            x2 = int(box["x2"])
+            y2 = int(box["y2"])
 
-    # ========================================================
-    # DAMAGE TYPES
-    # ========================================================
+            risk = detection["risk_score"]
 
-    damage_types = sorted(
-        set(
-            item["damage_type"]
-            for item in analyzed
-        )
-    )
+            # Color based on priority
+            if detection["priority"] == "HIGH":
+                color = (0, 0, 255)
 
-    # ========================================================
-    # COUNTS
-    # ========================================================
+            elif detection["priority"] == "MEDIUM":
+                color = (0, 165, 255)
 
-    high_count = sum(
-        item["priority"] == "HIGH"
-        for item in analyzed
-    )
+            else:
+                color = (0, 200, 0)
 
-    medium_count = sum(
-        item["priority"] == "MEDIUM"
-        for item in analyzed
-    )
+            # Bounding box
+            cv2.rectangle(
+                image,
+                (x1, y1),
+                (x2, y2),
+                color,
+                3,
+            )
 
-    low_count = sum(
-        item["priority"] == "LOW"
-        for item in analyzed
-    )
+            # Label
+            label = (
+                f"{detection['damage_type']} | "
+                f"{detection['confidence'] * 100:.0f}% | "
+                f"Risk {risk:.0f}"
+            )
 
-    # ========================================================
-    # RECOMMENDATION
-    # ========================================================
+            font = cv2.FONT_HERSHEY_SIMPLEX
 
-    if overall_priority == "HIGH":
+            font_scale = 0.55
+            thickness = 2
 
-        recommendation = (
-            "High-priority road damage detected. "
-            "The affected section should be considered "
-            "for prompt field inspection."
-        )
+            (text_width, text_height), baseline = (
+                cv2.getTextSize(
+                    label,
+                    font,
+                    font_scale,
+                    thickness,
+                )
+            )
 
-    elif overall_priority == "MEDIUM":
+            label_y = max(
+                text_height + 10,
+                y1
+            )
 
-        recommendation = (
-            "Moderate-priority road damage detected. "
-            "Schedule inspection and monitor the "
-            "affected road section."
-        )
+            # Background
+            cv2.rectangle(
+                image,
+                (
+                    x1,
+                    label_y - text_height - 10,
+                ),
+                (
+                    x1 + text_width + 10,
+                    label_y + baseline - 5,
+                ),
+                color,
+                -1,
+            )
 
-    else:
+            # Text
+            cv2.putText(
+                image,
+                label,
+                (
+                    x1 + 5,
+                    label_y - 5,
+                ),
+                font,
+                font_scale,
+                (255, 255, 255),
+                thickness,
+                cv2.LINE_AA,
+            )
 
-        recommendation = (
-            "Only low-priority visual damage was detected. "
-            "Continue monitoring during future inspections."
-        )
+        # -----------------------------------------------
+        # Dashboard panel
+        # -----------------------------------------------
 
-    # ========================================================
-    # RETURN
-    # ========================================================
+        panel_width = 420
 
-    return {
-        "detections_count": len(
-            analyzed
-        ),
-
-        "damage_types_detected": damage_types,
-
-        "overall_risk_score": round(
-            overall_risk,
-            2,
-        ),
-
-        "overall_severity_score": round(
-            overall_severity_score,
-            2,
-        ),
-
-        "overall_severity":
-            overall_severity,
-
-        "overall_priority":
-            overall_priority,
-
-        "priority_counts": {
-            "HIGH": high_count,
-            "MEDIUM": medium_count,
-            "LOW": low_count,
-        },
-
-        "highest_risk_detection":
-            highest_risk,
-
-        "highest_severity_detection":
-            highest_severity,
-
-        "recommendation":
-            recommendation,
-
-        "detections":
-            analyzed,
-    }
-
-
-# ============================================================
-# SIMPLE DETECTION ADAPTER
-# ============================================================
-
-def analyze_yolo_detection(
-    damage_class_id: int,
-    confidence: float,
-    xyxy: Sequence[float],
-    image_width: int,
-    image_height: int,
-    config: SeverityConfig = DEFAULT_CONFIG,
-    detection_id: Optional[int] = None,
-) -> Dict[str, Any]:
-    """
-    Convenience function for directly connecting this module
-    to a YOLO result.
-
-    Example:
-
-        analyze_yolo_detection(
-            damage_class_id=4,
-            confidence=0.91,
-            xyxy=[100, 200, 500, 600],
-            image_width=1920,
-            image_height=1080,
-        )
-    """
-
-    damage_name = CLASS_NAMES.get(
-        int(damage_class_id),
-        f"Unknown Class {damage_class_id}",
-    )
-
-    return analyze_detection(
-        damage_name=damage_name,
-        confidence=confidence,
-        box=xyxy,
-        image_width=image_width,
-        image_height=image_height,
-        config=config,
-        detection_id=detection_id,
-    )
-
-
-# ============================================================
-# SCORE BREAKDOWN
-# ============================================================
-
-def get_score_breakdown(
-    damage_name: str,
-    confidence: float,
-    area_ratio: float,
-    config: SeverityConfig = DEFAULT_CONFIG,
-) -> Dict[str, Any]:
-    """
-    Return the individual components contributing to
-    the RoadGuard risk score.
-
-    This is particularly useful for explainable AI dashboards.
-    """
-
-    damage_score = get_damage_class_score(
-        damage_name
-    )
-
-    confidence_score = calculate_confidence_score(
-        confidence
-    )
-
-    area_score = calculate_area_score(
-        area_ratio,
-        config,
-    )
-
-    damage_contribution = (
-        config.risk_damage_weight
-        * damage_score
-    )
-
-    confidence_contribution = (
-        config.risk_confidence_weight
-        * confidence_score
-    )
-
-    area_contribution = (
-        config.risk_area_weight
-        * area_score
-    )
-
-    final_score = (
-        damage_contribution
-        +
-        confidence_contribution
-        +
-        area_contribution
-    )
-
-    return {
-        "damage_type": damage_name,
-
-        "damage_score": round(
-            damage_score,
-            2,
-        ),
-
-        "confidence_score": round(
-            confidence_score,
-            2,
-        ),
-
-        "area_score": round(
-            area_score,
-            2,
-        ),
-
-        "weights": {
-            "damage": config.risk_damage_weight,
-            "confidence":
-                config.risk_confidence_weight,
-            "area":
-                config.risk_area_weight,
-        },
-
-        "contributions": {
-            "damage": round(
-                damage_contribution,
-                2,
+        panel = np.zeros(
+            (
+                image.shape[0],
+                panel_width,
+                3,
             ),
-            "confidence": round(
-                confidence_contribution,
-                2,
-            ),
-            "area": round(
-                area_contribution,
-                2,
-            ),
-        },
+            dtype=np.uint8,
+        )
 
-        "final_risk_score": round(
-            _clamp(final_score),
+        # Dark panel
+        panel[:] = (30, 30, 30)
+
+        y = 45
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+
+        # Title
+        cv2.putText(
+            panel,
+            "ROADGUARD",
+            (25, y),
+            font,
+            1.1,
+            (255, 255, 255),
+            3,
+            cv2.LINE_AA,
+        )
+
+        y += 45
+
+        cv2.putText(
+            panel,
+            "Infrastructure Intelligence",
+            (25, y),
+            font,
+            0.55,
+            (200, 200, 200),
+            1,
+            cv2.LINE_AA,
+        )
+
+        y += 45
+
+        # Summary
+        cv2.putText(
+            panel,
+            f"Damage detected: {report['detections_count']}",
+            (25, y),
+            font,
+            0.65,
+            (255, 255, 255),
             2,
-        ),
-    }
+            cv2.LINE_AA,
+        )
 
+        y += 38
 
-# ============================================================
-# BATCH ANALYSIS
-# ============================================================
+        cv2.putText(
+            panel,
+            f"Risk score: {report['overall_risk_score']:.0f}/100",
+            (25, y),
+            font,
+            0.65,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
 
-def analyze_batch(
-    roads: Iterable[Dict[str, Any]],
-    config: SeverityConfig = DEFAULT_CONFIG,
-) -> List[Dict[str, Any]]:
-    """
-    Analyze multiple road/image records.
+        y += 38
 
-    Each record should contain:
+        cv2.putText(
+            panel,
+            f"Priority: {report['overall_priority']}",
+            (25, y),
+            font,
+            0.65,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
 
-        {
-            "image": "road1.jpg",
-            "image_width": 1920,
-            "image_height": 1080,
-            "detections": [...]
+        y += 50
+
+        cv2.line(
+            panel,
+            (25, y),
+            (panel_width - 25, y),
+            (100, 100, 100),
+            1,
+        )
+
+        y += 35
+
+        # Individual detections
+        for detection in report["detections"]:
+
+            cv2.putText(
+                panel,
+                f"#{detection['id']} "
+                f"{detection['damage_type']}",
+                (25, y),
+                font,
+                0.52,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+
+            y += 28
+
+            cv2.putText(
+                panel,
+                f"Confidence: "
+                f"{detection['confidence'] * 100:.1f}%",
+                (40, y),
+                font,
+                0.48,
+                (190, 190, 190),
+                1,
+                cv2.LINE_AA,
+            )
+
+            y += 25
+
+            cv2.putText(
+                panel,
+                f"Severity: "
+                f"{detection['severity']}",
+                (40, y),
+                font,
+                0.48,
+                (190, 190, 190),
+                1,
+                cv2.LINE_AA,
+            )
+
+            y += 25
+
+            cv2.putText(
+                panel,
+                f"Risk: "
+                f"{detection['risk_score']:.0f}/100",
+                (40, y),
+                font,
+                0.48,
+                (190, 190, 190),
+                1,
+                cv2.LINE_AA,
+            )
+
+            y += 25
+
+            cv2.putText(
+                panel,
+                f"Priority: "
+                f"{detection['priority']}",
+                (40, y),
+                font,
+                0.48,
+                (190, 190, 190),
+                1,
+                cv2.LINE_AA,
+            )
+
+            y += 40
+
+            if y > panel.shape[0] - 60:
+                break
+
+        # -----------------------------------------------
+        # Combine image + panel
+        # -----------------------------------------------
+
+        combined = np.hstack(
+            [image, panel]
+        )
+
+        return combined
+
+    # --------------------------------------------------------
+    # SAVE JSON REPORT
+    # --------------------------------------------------------
+
+    @staticmethod
+    def save_json(
+        report: Dict,
+        output_path: str | Path,
+    ):
+
+        output_path = Path(output_path)
+
+        output_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        with open(
+            output_path,
+            "w",
+            encoding="utf-8",
+        ) as f:
+
+            json.dump(
+                report,
+                f,
+                indent=4,
+            )
+
+        print(
+            f"JSON report saved: "
+            f"{output_path}"
+        )
+
+    # --------------------------------------------------------
+    # PROCESS IMAGE
+    # --------------------------------------------------------
+
+    def process_image(
+        self,
+        image_path: str | Path,
+        output_dir: str | Path = "outputs",
+        save_json: bool = True,
+    ):
+
+        image_path = Path(image_path)
+        output_dir = Path(output_dir)
+
+        output_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        print("\n" + "=" * 60)
+        print("PROCESSING IMAGE")
+        print("=" * 60)
+        print(f"Input: {image_path}")
+
+        output = self.predict_image(
+            image_path
+        )
+
+        annotated = self.draw_results(
+            output
+        )
+
+        output_image = (
+            output_dir /
+            f"{image_path.stem}_roadguard.jpg"
+        )
+
+        cv2.imwrite(
+            str(output_image),
+            annotated,
+        )
+
+        print(
+            f"Annotated image: {output_image}"
+        )
+
+        if save_json:
+
+            output_json = (
+                output_dir /
+                f"{image_path.stem}_report.json"
+            )
+
+            self.save_json(
+                output["report"],
+                output_json,
+            )
+
+        self.print_report(
+            output["report"]
+        )
+
+        return output["report"]
+
+    # --------------------------------------------------------
+    # PROCESS FOLDER
+    # --------------------------------------------------------
+
+    def process_folder(
+        self,
+        folder_path: str | Path,
+        output_dir: str | Path = "outputs",
+    ):
+
+        folder_path = Path(folder_path)
+
+        if not folder_path.exists():
+            raise FileNotFoundError(
+                f"Folder not found: {folder_path}"
+            )
+
+        extensions = {
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".bmp",
+            ".webp",
         }
-    """
 
-    results = []
+        images = [
+            p for p in folder_path.iterdir()
+            if p.suffix.lower() in extensions
+        ]
 
-    for road in roads:
+        images.sort()
 
-        image_name = road.get(
-            "image",
-            "unknown",
+        print(
+            f"\nFound {len(images)} images."
         )
+
+        all_reports = []
+
+        for i, image_path in enumerate(images):
+
+            print(
+                f"\n[{i + 1}/{len(images)}] "
+                f"{image_path.name}"
+            )
+
+            try:
+
+                report = self.process_image(
+                    image_path,
+                    output_dir,
+                    save_json=True,
+                )
+
+                all_reports.append(
+                    report
+                )
+
+            except Exception as e:
+
+                print(
+                    f"ERROR processing "
+                    f"{image_path.name}: {e}"
+                )
+
+        # Save combined report
+        combined_path = (
+            Path(output_dir) /
+            "roadguard_batch_report.json"
+        )
+
+        with open(
+            combined_path,
+            "w",
+            encoding="utf-8",
+        ) as f:
+
+            json.dump(
+                all_reports,
+                f,
+                indent=4,
+            )
+
+        print(
+            f"\nCombined report saved: "
+            f"{combined_path}"
+        )
+
+        return all_reports
+
+    # --------------------------------------------------------
+    # VIDEO / WEBCAM
+    # --------------------------------------------------------
+
+    def process_video(
+        self,
+        source,
+        output_path: str | Path = "outputs/roadguard_video.mp4",
+        display: bool = False,
+    ):
+        """
+        Process a video or webcam.
+
+        source:
+            0 -> webcam
+            "video.mp4" -> video file
+        """
+
+        output_path = Path(output_path)
+        output_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        cap = cv2.VideoCapture(source)
+
+        if not cap.isOpened():
+            raise RuntimeError(
+                f"Unable to open video source: {source}"
+            )
+
+        fps = cap.get(
+            cv2.CAP_PROP_FPS
+        )
+
+        if fps <= 0:
+            fps = 25.0
 
         width = int(
-            road.get(
-                "image_width",
-                1,
+            cap.get(
+                cv2.CAP_PROP_FRAME_WIDTH
             )
         )
 
         height = int(
-            road.get(
-                "image_height",
-                1,
+            cap.get(
+                cv2.CAP_PROP_FRAME_HEIGHT
             )
         )
 
-        detections = road.get(
-            "detections",
-            [],
+        fourcc = cv2.VideoWriter_fourcc(
+            *"mp4v"
         )
 
-        analysis = analyze_detections(
-            detections=detections,
-            image_width=width,
-            image_height=height,
-            config=config,
+        writer = cv2.VideoWriter(
+            str(output_path),
+            fourcc,
+            fps,
+            (
+                width + 420,
+                height,
+            ),
         )
 
-        results.append({
-            "image": image_name,
-            "analysis": analysis,
-        })
+        frame_number = 0
 
-    return results
+        print("\nStarting video processing...")
+        print("Press Q to stop.")
 
+        try:
 
-# ============================================================
-# SAVE ANALYSIS
-# ============================================================
+            while True:
 
-def save_analysis_json(
-    analysis: Dict[str, Any],
-    output_path: str | Path,
-) -> None:
-    """
-    Save a RoadGuard analysis as JSON.
-    """
+                ret, frame = cap.read()
 
-    output_path = Path(
-        output_path
-    )
+                if not ret:
+                    break
 
-    output_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+                frame_number += 1
 
-    with open(
-        output_path,
-        "w",
-        encoding="utf-8",
-    ) as file:
+                # YOLO accepts numpy arrays directly.
+                results = self.model.predict(
+                    source=frame,
+                    conf=self.confidence,
+                    iou=self.iou,
+                    imgsz=self.image_size,
+                    device=self.device,
+                    verbose=False,
+                )
 
-        json.dump(
-            analysis,
-            file,
-            indent=4,
-            ensure_ascii=False,
+                result = results[0]
+
+                # Convert prediction result into
+                # RoadGuard-style output.
+                detections = []
+
+                if result.boxes is not None:
+
+                    for index in range(
+                        len(result.boxes)
+                    ):
+
+                        cls_id = int(
+                            result.boxes.cls[index]
+                            .item()
+                        )
+
+                        confidence = float(
+                            result.boxes.conf[index]
+                            .item()
+                        )
+
+                        x1, y1, x2, y2 = map(
+                            float,
+                            result.boxes.xyxy[
+                                index
+                            ].cpu().numpy(),
+                        )
+
+                        damage_name = (
+                            CLASS_NAMES.get(
+                                cls_id,
+                                f"Unknown {cls_id}",
+                            )
+                        )
+
+                        area_ratio = (
+                            self.calculate_area_ratio(
+                                x1,
+                                y1,
+                                x2,
+                                y2,
+                                width,
+                                height,
+                            )
+                        )
+
+                        severity = (
+                            self.calculate_severity(
+                                area_ratio,
+                                confidence,
+                            )
+                        )
+
+                        risk_score = (
+                            self.calculate_risk_score(
+                                damage_name,
+                                confidence,
+                                area_ratio,
+                            )
+                        )
+
+                        priority = (
+                            self.get_priority(
+                                risk_score
+                            )
+                        )
+
+                        detections.append({
+                            "id": index + 1,
+                            "damage_type":
+                                damage_name,
+                            "confidence":
+                                confidence,
+                            "bounding_box": {
+                                "x1": x1,
+                                "y1": y1,
+                                "x2": x2,
+                                "y2": y2,
+                            },
+                            "severity":
+                                severity,
+                            "risk_score":
+                                risk_score,
+                            "priority":
+                                priority,
+                        })
+
+                if detections:
+
+                    overall_risk = max(
+                        d["risk_score"]
+                        for d in detections
+                    )
+
+                else:
+
+                    overall_risk = 0.0
+
+                overall_priority = (
+                    self.get_priority(
+                        overall_risk
+                    )
+                )
+
+                frame_report = {
+                    "detections": detections,
+                    "detections_count":
+                        len(detections),
+                    "overall_risk_score":
+                        overall_risk,
+                    "overall_priority":
+                        overall_priority,
+                }
+
+                inference_output = {
+                    "report": frame_report,
+                    "original_image": frame,
+                }
+
+                annotated = self.draw_results(
+                    inference_output
+                )
+
+                writer.write(
+                    annotated
+                )
+
+                if display:
+
+                    cv2.imshow(
+                        "RoadGuard",
+                        annotated,
+                    )
+
+                    if (
+                        cv2.waitKey(1)
+                        & 0xFF
+                    ) == ord("q"):
+                        break
+
+        finally:
+
+            cap.release()
+            writer.release()
+
+            if display:
+                cv2.destroyAllWindows()
+
+        print(
+            f"\nVideo saved to: "
+            f"{output_path}"
         )
 
+    # --------------------------------------------------------
+    # PRINT REPORT
+    # --------------------------------------------------------
 
-# ============================================================
-# LOAD ANALYSIS
-# ============================================================
-
-def load_analysis_json(
-    input_path: str | Path,
-) -> Dict[str, Any]:
-    """
-    Load a previously generated RoadGuard JSON report.
-    """
-
-    input_path = Path(
-        input_path
-    )
-
-    if not input_path.exists():
-        raise FileNotFoundError(
-            f"Analysis file not found: "
-            f"{input_path}"
-        )
-
-    with open(
-        input_path,
-        "r",
-        encoding="utf-8",
-    ) as file:
-
-        return json.load(
-            file
-        )
-
-
-# ============================================================
-# HUMAN-READABLE SUMMARY
-# ============================================================
-
-def format_summary(
-    analysis: Dict[str, Any],
-) -> str:
-    """
-    Create a clean text summary for terminal output
-    or application interfaces.
-    """
-
-    lines = []
-
-    lines.append(
-        "=" * 60
-    )
-
-    lines.append(
-        "ROADGUARD INFRASTRUCTURE ANALYSIS"
-    )
-
-    lines.append(
-        "=" * 60
-    )
-
-    lines.append(
-        f"Damage detected : "
-        f"{analysis.get('detections_count', 0)}"
-    )
-
-    lines.append(
-        f"Overall risk    : "
-        f"{analysis.get('overall_risk_score', 0):.2f}/100"
-    )
-
-    lines.append(
-        f"Overall severity: "
-        f"{analysis.get('overall_severity', 'LOW')}"
-    )
-
-    lines.append(
-        f"Overall priority: "
-        f"{analysis.get('overall_priority', 'LOW')}"
-    )
-
-    lines.append(
-        ""
-    )
-
-    priority_counts = analysis.get(
-        "priority_counts",
-        {},
-    )
-
-    lines.append(
-        "Priority distribution:"
-    )
-
-    lines.append(
-        f"  HIGH   : "
-        f"{priority_counts.get('HIGH', 0)}"
-    )
-
-    lines.append(
-        f"  MEDIUM : "
-        f"{priority_counts.get('MEDIUM', 0)}"
-    )
-
-    lines.append(
-        f"  LOW    : "
-        f"{priority_counts.get('LOW', 0)}"
-    )
-
-    lines.append(
-        ""
-    )
-
-    lines.append(
-        "Recommendation:"
-    )
-
-    lines.append(
-        analysis.get(
-            "recommendation",
-            "",
-        )
-    )
-
-    lines.append(
-        ""
-    )
-
-    lines.append(
-        "-" * 60
-    )
-
-    for detection in analysis.get(
-        "detections",
-        [],
+    @staticmethod
+    def print_report(
+        report: Dict,
     ):
 
-        lines.append(
-            f"Detection #{detection.get('id')}"
+        print("\n")
+        print("=" * 60)
+        print("ROADGUARD ANALYSIS")
+        print("=" * 60)
+
+        print(
+            f"Damage detected : "
+            f"{report['detections_count']}"
         )
 
-        lines.append(
-            f"  Damage      : "
-            f"{detection.get('damage_type')}"
+        print(
+            f"Overall risk    : "
+            f"{report['overall_risk_score']:.2f}/100"
         )
 
-        lines.append(
-            f"  Confidence  : "
-            f"{detection.get('confidence_percentage', 0):.1f}%"
+        print(
+            f"Overall priority: "
+            f"{report['overall_priority']}"
         )
 
-        lines.append(
-            f"  Area        : "
-            f"{detection.get('area_percentage', 0):.2f}%"
-        )
+        print("-" * 60)
 
-        lines.append(
-            f"  Severity    : "
-            f"{detection.get('severity')}"
-        )
+        if not report["detections"]:
 
-        lines.append(
-            f"  Risk        : "
-            f"{detection.get('risk_score', 0):.2f}/100"
-        )
+            print(
+                "No road damage detected."
+            )
 
-        lines.append(
-            f"  Priority    : "
-            f"{detection.get('priority')}"
-        )
+        for detection in report[
+            "detections"
+        ]:
 
-        lines.append(
-            ""
-        )
+            print(
+                f"\nDetection #{detection['id']}"
+            )
 
-    lines.append(
-        "=" * 60
-    )
+            print(
+                f"  Damage     : "
+                f"{detection['damage_type']}"
+            )
 
-    return "\n".join(
-        lines
-    )
+            print(
+                f"  Confidence : "
+                f"{detection['confidence'] * 100:.2f}%"
+            )
+
+            print(
+                f"  Area       : "
+                f"{detection['area_percentage']:.2f}%"
+            )
+
+            print(
+                f"  Severity   : "
+                f"{detection['severity']}"
+            )
+
+            print(
+                f"  Risk Score : "
+                f"{detection['risk_score']:.2f}/100"
+            )
+
+            print(
+                f"  Priority   : "
+                f"{detection['priority']}"
+            )
+
+            print(
+                f"  Action     : "
+                f"{detection['recommendation']}"
+            )
+
+        print("=" * 60)
 
 
 # ============================================================
-# ENGINE INFORMATION
+# COMMAND LINE INTERFACE
 # ============================================================
 
-def get_engine_info() -> Dict[str, Any]:
-    """
-    Return metadata about the RoadGuard severity engine.
-    """
+def parse_arguments():
 
-    return {
-        "name":
-            "RoadGuard Severity & Risk Engine",
+    parser = argparse.ArgumentParser(
+        description=(
+            "RoadGuard Infrastructure "
+            "Intelligence - AI Road Damage Detection"
+        )
+    )
 
-        "version":
-            SEVERITY_ENGINE_VERSION,
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=DEFAULT_MODEL,
+        help="Path to trained RoadGuard .pt model",
+    )
 
-        "classes":
-            CLASS_NAMES,
-
-        "damage_weights":
-            DAMAGE_WEIGHTS,
-
-        "risk_formula": {
-            "damage_type": 0.45,
-            "confidence": 0.30,
-            "visible_area": 0.25,
-        },
-
-        "severity_formula": {
-            "visible_area": 0.70,
-            "confidence": 0.30,
-        },
-
-        "risk_thresholds": {
-            "HIGH":
-                DEFAULT_CONFIG.high_risk_threshold,
-            "MEDIUM":
-                DEFAULT_CONFIG.medium_risk_threshold,
-        },
-
-        "severity_thresholds": {
-            "HIGH":
-                DEFAULT_CONFIG.high_severity_threshold,
-            "MEDIUM":
-                DEFAULT_CONFIG.medium_severity_threshold,
-        },
-
-        "note": (
-            "Scores are engineered decision-support "
-            "signals and are not calibrated probabilities "
-            "of accidents or maintenance outcomes."
+    parser.add_argument(
+        "--source",
+        type=str,
+        required=True,
+        help=(
+            "Image, folder, video path, "
+            "or webcam index such as 0"
         ),
-    }
+    )
+
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="outputs",
+        help="Output directory",
+    )
+
+    parser.add_argument(
+        "--conf",
+        type=float,
+        default=0.25,
+        help="Detection confidence threshold",
+    )
+
+    parser.add_argument(
+        "--iou",
+        type=float,
+        default=0.45,
+        help="IoU threshold for NMS",
+    )
+
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=640,
+        help="Inference image size",
+    )
+
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help=(
+            "Device: cpu, cuda, 0, 1, etc. "
+            "Default = automatic"
+        ),
+    )
+
+    parser.add_argument(
+        "--webcam",
+        action="store_true",
+        help="Use webcam",
+    )
+
+    parser.add_argument(
+        "--display",
+        action="store_true",
+        help="Display video/webcam while processing",
+    )
+
+    return parser.parse_args()
 
 
 # ============================================================
-# DEMO
-# ============================================================
-
-def demo():
-    """
-    Run a small demonstration without requiring YOLO.
-
-    Useful for testing severity.py independently.
-    """
-
-    print(
-        "\n"
-        + "=" * 60
-    )
-
-    print(
-        "ROADGUARD SEVERITY ENGINE DEMO"
-    )
-
-    print(
-        "=" * 60
-    )
-
-    # Example detections generated by the CV model.
-    detections = [
-
-        {
-            "damage_type":
-                "Pothole",
-
-            "confidence":
-                0.91,
-
-            "bounding_box": {
-                "x1": 400,
-                "y1": 300,
-                "x2": 850,
-                "y2": 650,
-            },
-        },
-
-        {
-            "damage_type":
-                "Longitudinal Crack",
-
-            "confidence":
-                0.82,
-
-            "bounding_box": {
-                "x1": 100,
-                "y1": 500,
-                "x2": 600,
-                "y2": 560,
-            },
-        },
-    ]
-
-    analysis = analyze_detections(
-        detections=detections,
-        image_width=1920,
-        image_height=1080,
-    )
-
-    print(
-        format_summary(
-            analysis
-        )
-    )
-
-    print(
-        "\nJSON representation:"
-    )
-
-    print(
-        json.dumps(
-            analysis,
-            indent=4,
-        )
-    )
-
-
-# ============================================================
-# COMMAND LINE TEST
+# MAIN
 # ============================================================
 
 def main():
-    """
-    Run the standalone severity engine demo.
 
-    Usage:
+    args = parse_arguments()
 
-        python severity.py
+    # Create RoadGuard engine
+    roadguard = RoadGuard(
+        model_path=args.model,
+        confidence=args.conf,
+        iou=args.iou,
+        image_size=args.imgsz,
+        device=args.device,
+    )
 
-    """
+    source = args.source
 
-    demo()
+    # --------------------------------------------------------
+    # WEBCAM
+    # --------------------------------------------------------
 
+    if args.webcam:
 
-# ============================================================
-# ENTRY POINT
-# ============================================================
+        try:
+            camera_index = int(source)
+        except ValueError:
+            camera_index = 0
+
+        roadguard.process_video(
+            source=camera_index,
+            output_path=(
+                Path(args.output) /
+                "roadguard_webcam.mp4"
+            ),
+            display=True,
+        )
+
+        return
+
+    source_path = Path(source)
+
+    # --------------------------------------------------------
+    # FOLDER
+    # --------------------------------------------------------
+
+    if source_path.is_dir():
+
+        roadguard.process_folder(
+            folder_path=source_path,
+            output_dir=args.output,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # IMAGE
+    # --------------------------------------------------------
+
+    image_extensions = {
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".bmp",
+        ".webp",
+    }
+
+    if (
+        source_path.is_file()
+        and source_path.suffix.lower()
+        in image_extensions
+    ):
+
+        roadguard.process_image(
+            image_path=source_path,
+            output_dir=args.output,
+            save_json=True,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # VIDEO
+    # --------------------------------------------------------
+
+    video_extensions = {
+        ".mp4",
+        ".avi",
+        ".mov",
+        ".mkv",
+        ".webm",
+    }
+
+    if (
+        source_path.is_file()
+        and source_path.suffix.lower()
+        in video_extensions
+    ):
+
+        roadguard.process_video(
+            source=source_path,
+            output_path=(
+                Path(args.output) /
+                "roadguard_video.mp4"
+            ),
+            display=args.display,
+        )
+
+        return
+
+    raise ValueError(
+        "\nUnsupported source.\n\n"
+        "Examples:\n"
+        "  image.jpg\n"
+        "  images/\n"
+        "  road_video.mp4\n"
+        "  --webcam --source 0\n"
+    )
+
 
 if __name__ == "__main__":
     main()
