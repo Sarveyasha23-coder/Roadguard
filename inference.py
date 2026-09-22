@@ -53,7 +53,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================
 
-DEFAULT_MODEL = "models/roadguard_best.pt"
+DEFAULT_MODEL = "roadguard_best.pt"
 
 # RDD2022 classes used during training.
 CLASS_NAMES = {
