@@ -1,68 +1,39 @@
 """
-============================================================
-ROADGUARD INFRASTRUCTURE INTELLIGENCE
-============================================================
+RoadGuard Infrastructure Intelligence
+=====================================
 
-AI-Powered Road Damage Detection, Severity Assessment
-and Infrastructure Maintenance Prioritization
+Streamlit application for road-damage detection using a YOLOv8
+model trained on the RDD2022 dataset.
 
-Dataset:
-    RDD2022
+Expected project structure:
 
-Model:
-    YOLOv8n
+Roadguard/
+├── app.py
+├── roadguard_best.pt
+├── requirements.txt
+└── README.md
 
-Detection Classes:
-    1. Longitudinal Crack
-    2. Transverse Crack
-    3. Alligator Crack
-    4. Other Corruption
-    5. Pothole
-
-Main Features:
-    - Road damage image upload
-    - YOLOv8n object detection
-    - Confidence threshold control
-    - Bounding-box visualization
-    - Damage severity estimation
-    - Infrastructure risk assessment
-    - Maintenance priority
-    - Detection statistics
-    - Detection table
-    - JSON report download
-    - Annotated image download
-    - Streamlit dashboard
-
-Project Structure:
-
-    Roadguard/
-    ├── app.py
-    ├── inference.py
-    ├── severity.py
-    ├── requirements.txt
-    ├── roadguard_best.pt
-    └── README.md
-
-============================================================
+The app is intentionally self-contained: it does not require
+inference.py or severity.py to run.
 """
 
 from __future__ import annotations
 
 import io
 import json
-import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
+from ultralytics import YOLO
 
 
 # ============================================================
-# PAGE CONFIGURATION
+# PAGE CONFIG
 # ============================================================
 
 st.set_page_config(
@@ -74,17 +45,11 @@ st.set_page_config(
 
 
 # ============================================================
-# PROJECT PATHS
+# PATHS AND CONSTANTS
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-
 MODEL_PATH = BASE_DIR / "roadguard_best.pt"
-
-
-# ============================================================
-# ROAD DAMAGE CLASSES
-# ============================================================
 
 CLASS_NAMES = {
     0: "Longitudinal Crack",
@@ -94,237 +59,98 @@ CLASS_NAMES = {
     4: "Pothole",
 }
 
+CLASS_WEIGHTS = {
+    "Longitudinal Crack": 25,
+    "Transverse Crack": 25,
+    "Alligator Crack": 35,
+    "Other Corruption": 20,
+    "Pothole": 40,
+}
+
 
 # ============================================================
-# PAGE STYLE
+# CUSTOM CSS
 # ============================================================
 
 st.markdown(
     """
-    <style>
+<style>
+.roadguard-header {
+    padding: 28px;
+    border-radius: 18px;
+    margin-bottom: 24px;
+    color: white;
+    background: linear-gradient(135deg, #111827, #374151);
+}
 
-    /* -----------------------------------------------------
-       Main application
-    ----------------------------------------------------- */
+.roadguard-title {
+    font-size: 36px;
+    font-weight: 800;
+    margin-bottom: 8px;
+}
 
-    .main {
-        background-color: #f7f8fa;
-    }
+.roadguard-subtitle {
+    font-size: 16px;
+    line-height: 1.6;
+    opacity: 0.92;
+}
 
-    /* -----------------------------------------------------
-       Header
-    ----------------------------------------------------- */
+.metric-card {
+    background: white;
+    border: 1px solid #e5e7eb;
+    border-radius: 14px;
+    padding: 18px;
+    min-height: 115px;
+    box-shadow: 0 3px 12px rgba(0, 0, 0, 0.05);
+}
 
-    .roadguard-header {
-        background: linear-gradient(
-            135deg,
-            #111827 0%,
-            #1f2937 55%,
-            #374151 100%
-        );
+.metric-title {
+    color: #6b7280;
+    font-size: 13px;
+    font-weight: 600;
+}
 
-        padding: 30px;
-        border-radius: 18px;
-        margin-bottom: 25px;
-        color: white;
-        box-shadow: 0 8px 25px rgba(0, 0, 0, 0.12);
-    }
+.metric-value {
+    color: #111827;
+    font-size: 28px;
+    font-weight: 800;
+    margin-top: 6px;
+}
 
-    .roadguard-title {
-        font-size: 38px;
-        font-weight: 800;
-        margin-bottom: 8px;
-    }
+.metric-description {
+    color: #6b7280;
+    font-size: 12px;
+    margin-top: 4px;
+}
 
-    .roadguard-subtitle {
-        font-size: 17px;
-        line-height: 1.6;
-        opacity: 0.9;
-    }
+.info-box {
+    background: #eff6ff;
+    border-left: 5px solid #2563eb;
+    padding: 15px;
+    border-radius: 9px;
+    margin: 12px 0;
+}
 
-    /* -----------------------------------------------------
-       Cards
-    ----------------------------------------------------- */
+.warning-box {
+    background: #fffbeb;
+    border-left: 5px solid #d97706;
+    padding: 15px;
+    border-radius: 9px;
+    margin: 12px 0;
+}
 
-    .metric-card {
-        background: white;
-        border-radius: 15px;
-        padding: 20px;
-        border: 1px solid #e5e7eb;
-        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.06);
-        min-height: 120px;
-    }
-
-    .metric-title {
-        font-size: 14px;
-        color: #6b7280;
-        font-weight: 600;
-        margin-bottom: 8px;
-    }
-
-    .metric-value {
-        font-size: 30px;
-        font-weight: 800;
-        color: #111827;
-    }
-
-    .metric-description {
-        font-size: 12px;
-        color: #6b7280;
-        margin-top: 5px;
-    }
-
-    /* -----------------------------------------------------
-       Severity cards
-    ----------------------------------------------------- */
-
-    .severity-card {
-        border-radius: 15px;
-        padding: 22px;
-        color: white;
-        margin-top: 10px;
-        margin-bottom: 10px;
-    }
-
-    .severity-critical {
-        background: linear-gradient(
-            135deg,
-            #7f1d1d,
-            #dc2626
-        );
-    }
-
-    .severity-high {
-        background: linear-gradient(
-            135deg,
-            #9a3412,
-            #ea580c
-        );
-    }
-
-    .severity-medium {
-        background: linear-gradient(
-            135deg,
-            #854d0e,
-            #ca8a04
-        );
-    }
-
-    .severity-low {
-        background: linear-gradient(
-            135deg,
-            #166534,
-            #16a34a
-        );
-    }
-
-    .severity-title {
-        font-size: 24px;
-        font-weight: 800;
-    }
-
-    .severity-text {
-        font-size: 14px;
-        margin-top: 8px;
-        line-height: 1.5;
-    }
-
-    /* -----------------------------------------------------
-       Information boxes
-    ----------------------------------------------------- */
-
-    .info-box {
-        background: #eff6ff;
-        border-left: 5px solid #2563eb;
-        padding: 15px;
-        border-radius: 10px;
-        margin-top: 10px;
-        margin-bottom: 15px;
-    }
-
-    .success-box {
-        background: #f0fdf4;
-        border-left: 5px solid #16a34a;
-        padding: 15px;
-        border-radius: 10px;
-        margin-top: 10px;
-        margin-bottom: 15px;
-    }
-
-    .warning-box {
-        background: #fffbeb;
-        border-left: 5px solid #d97706;
-        padding: 15px;
-        border-radius: 10px;
-        margin-top: 10px;
-        margin-bottom: 15px;
-    }
-
-    /* -----------------------------------------------------
-       Footer
-    ----------------------------------------------------- */
-
-    .footer {
-        margin-top: 50px;
-        padding: 20px;
-        text-align: center;
-        color: #6b7280;
-        font-size: 13px;
-        border-top: 1px solid #e5e7eb;
-    }
-
-    </style>
-    """,
+.footer {
+    text-align: center;
+    color: #6b7280;
+    font-size: 13px;
+    border-top: 1px solid #e5e7eb;
+    margin-top: 45px;
+    padding: 20px;
+}
+</style>
+""",
     unsafe_allow_html=True,
 )
-
-
-# ============================================================
-# IMPORT INFERENCE ENGINE
-# ============================================================
-
-try:
-
-    from inference import (
-        get_model,
-        predict_image,
-        summarize_detections,
-        annotate_image,
-        get_model_info,
-    )
-
-    INFERENCE_IMPORT_ERROR = None
-
-except Exception as exc:
-
-    get_model = None
-    predict_image = None
-    summarize_detections = None
-    annotate_image = None
-    get_model_info = None
-
-    INFERENCE_IMPORT_ERROR = exc
-
-
-# ============================================================
-# OPTIONAL SEVERITY ENGINE
-# ============================================================
-
-SEVERITY_ENGINE_AVAILABLE = False
-severity_engine = None
-
-try:
-
-    import severity as severity_module
-
-    severity_engine = severity_module
-
-    SEVERITY_ENGINE_AVAILABLE = True
-
-except Exception:
-
-    severity_engine = None
-    SEVERITY_ENGINE_AVAILABLE = False
 
 
 # ============================================================
@@ -333,21 +159,28 @@ except Exception:
 
 st.markdown(
     """
-    <div class="roadguard-header">
-
-        <div class="roadguard-title">
-            🚧 RoadGuard Infrastructure Intelligence
-        </div>
-
-        <div class="roadguard-subtitle">
-            AI-powered road damage detection, severity assessment,
-            infrastructure risk analysis and maintenance prioritization.
-        </div>
-
+<div class="roadguard-header">
+    <div class="roadguard-title">
+        🚧 RoadGuard Infrastructure Intelligence
     </div>
-    """,
+    <div class="roadguard-subtitle">
+        AI-powered road damage detection, severity assessment,
+        infrastructure risk analysis and maintenance prioritization.
+    </div>
+</div>
+""",
     unsafe_allow_html=True,
 )
+
+
+# ============================================================
+# MODEL LOADING
+# ============================================================
+
+@st.cache_resource
+def load_model(model_path: str) -> YOLO:
+    """Load and cache the YOLO model."""
+    return YOLO(model_path)
 
 
 # ============================================================
@@ -355,18 +188,7 @@ st.markdown(
 # ============================================================
 
 with st.sidebar:
-
-    st.markdown(
-        "## ⚙️ RoadGuard Controls"
-    )
-
-    st.markdown(
-        "---"
-    )
-
-    st.markdown(
-        "### 🤖 Model"
-    )
+    st.header("⚙️ RoadGuard Controls")
 
     confidence_threshold = st.slider(
         "Detection confidence",
@@ -374,10 +196,6 @@ with st.sidebar:
         max_value=0.95,
         value=0.35,
         step=0.05,
-        help=(
-            "Minimum confidence required for a detection "
-            "to be displayed."
-        ),
     )
 
     iou_threshold = st.slider(
@@ -386,118 +204,44 @@ with st.sidebar:
         max_value=0.90,
         value=0.45,
         step=0.05,
-        help=(
-            "Intersection-over-Union threshold used by YOLO "
-            "for non-maximum suppression."
-        ),
     )
 
     image_size = st.selectbox(
         "Inference image size",
-        options=[
-            320,
-            416,
-            512,
-            640,
-            768,
-        ],
+        [320, 416, 512, 640, 768],
         index=3,
-        help="Input image size used by the YOLO model.",
     )
 
-    st.markdown(
-        "---"
-    )
+    st.divider()
 
-    st.markdown(
-        "### 📊 Project Information"
-    )
+    st.subheader("📊 Project")
 
-    st.write(
-        "**Dataset:** RDD2022"
-    )
+    st.write("**Dataset:** RDD2022")
+    st.write("**Model:** YOLOv8n")
+    st.write("**Classes:** 5")
+    st.write("**Framework:** Ultralytics + Streamlit")
 
-    st.write(
-        "**Model:** YOLOv8n"
-    )
+    st.divider()
 
-    st.write(
-        "**Classes:** 5"
-    )
+    st.subheader("📁 Model")
 
-    st.write(
-        "**Application:** RoadGuard"
-    )
-
-    st.markdown(
-        "---"
-    )
-
-    st.markdown(
-        "### 📁 Model Location"
-    )
-
-    st.code(
-        str(MODEL_PATH),
-        language="text",
-    )
+    st.code(str(MODEL_PATH), language="text")
 
 
 # ============================================================
-# MODEL STATUS
+# CHECK MODEL FILE
 # ============================================================
 
 if not MODEL_PATH.exists():
-
-    st.error(
-        "🚨 RoadGuard model file was not found."
-    )
+    st.error("❌ Model file not found.")
 
     st.warning(
         f"""
-Expected model location:
+Expected file:
 
 {MODEL_PATH}
 
-Your GitHub repository should contain:
-
-Roadguard/
-├── app.py
-├── inference.py
-├── severity.py
-├── requirements.txt
-├── roadguard_best.pt
-└── README.md
-"""
-    )
-
-    st.stop()
-
-
-# ============================================================
-# INFERENCE ENGINE STATUS
-# ============================================================
-
-if INFERENCE_IMPORT_ERROR is not None:
-
-    st.error(
-        "Unable to initialize the RoadGuard inference engine."
-    )
-
-    st.code(
-        (
-            f"{type(INFERENCE_IMPORT_ERROR).__name__}: "
-            f"{INFERENCE_IMPORT_ERROR}"
-        ),
-        language="text",
-    )
-
-    st.warning(
-        """
-Please check the Streamlit deployment logs.
-
-The detailed error above is intentionally shown so that
-dependency or Ultralytics problems are not hidden.
+Make sure `roadguard_best.pt` is in the same folder as `app.py`.
 """
     )
 
@@ -508,158 +252,75 @@ dependency or Ultralytics problems are not hidden.
 # LOAD MODEL
 # ============================================================
 
-@st.cache_resource
-def load_roadguard_model():
-
-    return get_model(
-        model_path=MODEL_PATH
-    )
-
-
 try:
-
-    model = load_roadguard_model()
-
+    model = load_model(str(MODEL_PATH))
 except Exception as exc:
-
-    st.error(
-        "❌ Unable to load the RoadGuard model."
-    )
-
-    st.error(
-        f"{type(exc).__name__}: {exc}"
-    )
-
-    with st.expander(
-        "🔍 Technical error details"
-    ):
-
-        st.code(
-            traceback.format_exc(),
-            language="text",
-        )
-
-    st.warning(
-        """
-Make sure:
-
-1. roadguard_best.pt is present in the repository.
-2. The file is a valid YOLO model.
-3. Ultralytics is installed.
-4. PyTorch is installed correctly.
-5. The Streamlit deployment finished installing
-   all requirements.
-"""
-    )
-
+    st.error("❌ Could not load the YOLO model.")
+    st.exception(exc)
     st.stop()
 
 
-# ============================================================
-# MODEL READY
-# ============================================================
-
-st.success(
-    "✅ RoadGuard YOLOv8n model loaded successfully."
-)
+st.success("✅ RoadGuard YOLO model loaded successfully.")
 
 
 # ============================================================
-# UPLOAD SECTION
+# MODEL INFORMATION
 # ============================================================
 
-st.markdown(
-    "## 📷 Road Image Analysis"
-)
+with st.expander("🤖 Model Information"):
+    model_names = getattr(model, "names", None)
 
-st.markdown(
-    """
-Upload a road image and RoadGuard will detect visible road
-damage, estimate severity and generate a maintenance priority
-assessment.
-"""
-)
+    st.json(
+        {
+            "model_file": MODEL_PATH.name,
+            "model_type": "YOLOv8n",
+            "dataset": "RDD2022",
+            "classes": model_names if model_names else CLASS_NAMES,
+        }
+    )
+
+
+# ============================================================
+# UPLOAD IMAGE
+# ============================================================
+
+st.header("📷 Road Image Analysis")
 
 uploaded_file = st.file_uploader(
     "Upload a road image",
-    type=[
-        "jpg",
-        "jpeg",
-        "png",
-        "webp",
-        "bmp",
-    ],
-    help=(
-        "Supported formats: JPG, JPEG, PNG, WEBP and BMP."
-    ),
+    type=["jpg", "jpeg", "png", "webp", "bmp"],
 )
 
-
-# ============================================================
-# NO IMAGE
-# ============================================================
-
 if uploaded_file is None:
-
-    st.markdown(
-        """
-        <div class="info-box">
-
-        <strong>👆 Upload an image to begin.</strong>
-
-        <br><br>
-
-        RoadGuard accepts road images and uses a lightweight
-        YOLOv8n model trained on the RDD2022 road-damage dataset.
-
-        </div>
-        """,
-        unsafe_allow_html=True,
+    st.info(
+        "👆 Upload a road image and click **Analyze Road Damage**."
     )
 
-    st.markdown(
-        "## 🧠 Detection Classes"
-    )
+    st.subheader("🧠 Detection Classes")
 
-    class_columns = st.columns(5)
+    columns = st.columns(5)
 
-    for index, (
-        class_id,
-        class_name,
-    ) in enumerate(CLASS_NAMES.items()):
-
-        with class_columns[index]:
-
+    for index, class_name in CLASS_NAMES.items():
+        with columns[index]:
             st.markdown(
                 f"""
-                <div class="metric-card">
-
-                <div class="metric-title">
-                    Class {class_id}
-                </div>
-
-                <div style="
-                    font-size:16px;
-                    font-weight:700;
-                    color:#111827;
-                ">
-                    {class_name}
-                </div>
-
-                </div>
-                """,
+<div class="metric-card">
+    <div class="metric-title">Class {index}</div>
+    <div style="font-weight:700;margin-top:8px;">
+        {class_name}
+    </div>
+</div>
+""",
                 unsafe_allow_html=True,
             )
 
     st.markdown(
         """
-        <div class="footer">
-
-        RoadGuard Infrastructure Intelligence<br>
-        RDD2022 • YOLOv8n • Computer Vision
-
-        </div>
-        """,
+<div class="footer">
+RoadGuard Infrastructure Intelligence<br>
+RDD2022 • YOLOv8n • Computer Vision
+</div>
+""",
         unsafe_allow_html=True,
     )
 
@@ -667,49 +328,35 @@ if uploaded_file is None:
 
 
 # ============================================================
-# LOAD IMAGE
+# READ IMAGE
 # ============================================================
 
 try:
-
-    original_image = Image.open(
-        uploaded_file
-    ).convert("RGB")
-
+    original_image = Image.open(uploaded_file).convert("RGB")
 except Exception as exc:
-
-    st.error(
-        "Unable to read the uploaded image."
-    )
-
-    st.code(
-        f"{type(exc).__name__}: {exc}",
-        language="text",
-    )
-
+    st.error("❌ Unable to read the uploaded image.")
+    st.exception(exc)
     st.stop()
 
-
-# ============================================================
-# IMAGE INFORMATION
-# ============================================================
-
-image_width, image_height = (
-    original_image.size
-)
-
-image_array = np.asarray(
-    original_image
-)
+image_array = np.asarray(original_image)
+image_width, image_height = original_image.size
 
 
 # ============================================================
-# RUN INFERENCE BUTTON
+# IMAGE PREVIEW
 # ============================================================
 
-st.markdown(
-    "### 🔍 Detection"
-)
+with st.expander("🖼️ Uploaded Image", expanded=True):
+    st.image(
+        original_image,
+        caption=uploaded_file.name,
+        use_container_width=True,
+    )
+
+
+# ============================================================
+# ANALYZE BUTTON
+# ============================================================
 
 analyze_button = st.button(
     "🚀 Analyze Road Damage",
@@ -719,99 +366,107 @@ analyze_button = st.button(
 
 
 # ============================================================
-# AUTOMATIC ANALYSIS WHEN IMAGE IS UPLOADED
+# RUN INFERENCE
 # ============================================================
 
 if analyze_button:
-
-    with st.spinner(
-        "Running RoadGuard AI analysis..."
-    ):
-
+    with st.spinner("Running RoadGuard AI analysis..."):
         try:
-
-            detections = predict_image(
-                image=image_array,
-                confidence=confidence_threshold,
+            results = model.predict(
+                source=image_array,
+                conf=confidence_threshold,
                 iou=iou_threshold,
-                image_size=image_size,
-                model_path=MODEL_PATH,
+                imgsz=image_size,
+                verbose=False,
             )
-
         except Exception as exc:
-
-            st.error(
-                "❌ RoadGuard inference failed."
-            )
-
-            st.error(
-                f"{type(exc).__name__}: {exc}"
-            )
-
-            with st.expander(
-                "🔍 Full technical error"
-            ):
-
-                st.code(
-                    traceback.format_exc(),
-                    language="text",
-                )
-
+            st.error("❌ RoadGuard inference failed.")
+            st.exception(exc)
             st.stop()
 
-    # ========================================================
-    # SAVE RESULTS IN SESSION STATE
-    # ========================================================
+        result = results[0]
 
-    st.session_state["roadguard_detections"] = (
-        detections
-    )
+        detections: list[dict[str, Any]] = []
 
-    st.session_state["roadguard_image"] = (
-        original_image
-    )
+        if result.boxes is not None:
+            boxes = result.boxes
 
-    st.session_state["roadguard_filename"] = (
-        uploaded_file.name
-    )
+            xyxy = boxes.xyxy.cpu().numpy()
+            confidences = boxes.conf.cpu().numpy()
+            class_ids = boxes.cls.cpu().numpy().astype(int)
 
-    st.session_state["roadguard_analysis_time"] = (
-        datetime.now().isoformat()
-    )
+            for box, confidence, class_id in zip(
+                xyxy,
+                confidences,
+                class_ids,
+            ):
+                x1, y1, x2, y2 = [float(value) for value in box]
 
-    st.success(
-        "✅ Analysis completed successfully."
-    )
+                width = max(0.0, x2 - x1)
+                height = max(0.0, y2 - y1)
+                area = width * height
+
+                # Prefer the names stored inside the trained model.
+                model_names = getattr(model, "names", None)
+
+                if model_names:
+                    class_name = str(
+                        model_names.get(
+                            int(class_id),
+                            CLASS_NAMES.get(
+                                int(class_id),
+                                f"Class {class_id}",
+                            ),
+                        )
+                    )
+                else:
+                    class_name = CLASS_NAMES.get(
+                        int(class_id),
+                        f"Class {class_id}",
+                    )
+
+                detections.append(
+                    {
+                        "class_id": int(class_id),
+                        "class_name": class_name,
+                        "confidence": float(confidence),
+                        "bbox": {
+                            "x1": x1,
+                            "y1": y1,
+                            "x2": x2,
+                            "y2": y2,
+                        },
+                        "area": area,
+                    }
+                )
+
+        st.session_state["roadguard_detections"] = detections
+        st.session_state["roadguard_image"] = original_image
+        st.session_state["roadguard_filename"] = uploaded_file.name
+        st.session_state["roadguard_analysis_time"] = (
+            datetime.now().isoformat()
+        )
+
+        st.success(
+            f"✅ Analysis completed — {len(detections)} detection(s) found."
+        )
 
 
 # ============================================================
-# CHECK IF RESULTS EXIST
+# CHECK FOR RESULTS
 # ============================================================
 
-if (
-    "roadguard_detections"
-    not in st.session_state
-):
-
-    st.info(
-        "Click **Analyze Road Damage** to start the AI analysis."
-    )
-
+if "roadguard_detections" not in st.session_state:
+    st.info("Click **Analyze Road Damage** to run the model.")
     st.stop()
 
 
 # ============================================================
-# RETRIEVE RESULTS
+# GET RESULTS
 # ============================================================
 
-detections = st.session_state[
-    "roadguard_detections"
-]
-
-analysis_image = st.session_state[
-    "roadguard_image"
-]
-
+detections = st.session_state["roadguard_detections"]
+analysis_image = st.session_state["roadguard_image"]
 filename = st.session_state.get(
     "roadguard_filename",
     "road_image.jpg",
@@ -819,306 +474,167 @@ filename = st.session_state.get(
 
 
 # ============================================================
-# SUMMARY
+# SUMMARY VALUES
 # ============================================================
 
-if summarize_detections is not None:
+confidence_values = [
+    float(item["confidence"])
+    for item in detections
+]
 
-    summary = summarize_detections(
-        detections
-    )
+total_detections = len(detections)
 
-else:
+average_confidence = (
+    float(np.mean(confidence_values))
+    if confidence_values
+    else 0.0
+)
 
-    confidence_values = [
-        float(
-            item.get(
-                "confidence",
-                0,
-            )
-        )
-        for item in detections
-    ]
-
-    class_counts: Dict[str, int] = {}
-
-    for item in detections:
-
-        class_name = item.get(
-            "class_name",
-            "Unknown",
-        )
-
-        class_counts[class_name] = (
-            class_counts.get(
-                class_name,
-                0,
-            )
-            + 1
-        )
-
-    summary = {
-        "total_detections": len(detections),
-        "average_confidence": (
-            sum(confidence_values)
-            / len(confidence_values)
-            if confidence_values
-            else 0
-        ),
-        "highest_confidence": (
-            max(confidence_values)
-            if confidence_values
-            else 0
-        ),
-        "classes": class_counts,
-    }
+highest_confidence = (
+    float(np.max(confidence_values))
+    if confidence_values
+    else 0.0
+)
 
 
 # ============================================================
 # TOP METRICS
 # ============================================================
 
-st.markdown(
-    "## 📊 Detection Overview"
-)
-
-total_detections = int(
-    summary.get(
-        "total_detections",
-        len(detections),
-    )
-)
-
-average_confidence = float(
-    summary.get(
-        "average_confidence",
-        0,
-    )
-)
-
-highest_confidence = float(
-    summary.get(
-        "highest_confidence",
-        0,
-    )
-)
-
+st.header("📊 Detection Overview")
 
 metric_columns = st.columns(4)
 
-
 with metric_columns[0]:
-
     st.markdown(
         f"""
-        <div class="metric-card">
-
-        <div class="metric-title">
-            Total Damage Detections
-        </div>
-
-        <div class="metric-value">
-            {total_detections}
-        </div>
-
-        <div class="metric-description">
-            Objects detected in the image
-        </div>
-
-        </div>
-        """,
+<div class="metric-card">
+    <div class="metric-title">Total Detections</div>
+    <div class="metric-value">{total_detections}</div>
+    <div class="metric-description">Detected road-damage objects</div>
+</div>
+""",
         unsafe_allow_html=True,
     )
-
 
 with metric_columns[1]:
-
     st.markdown(
         f"""
-        <div class="metric-card">
-
-        <div class="metric-title">
-            Average Confidence
-        </div>
-
-        <div class="metric-value">
-            {average_confidence:.1%}
-        </div>
-
-        <div class="metric-description">
-            Mean detection confidence
-        </div>
-
-        </div>
-        """,
+<div class="metric-card">
+    <div class="metric-title">Average Confidence</div>
+    <div class="metric-value">{average_confidence:.1%}</div>
+    <div class="metric-description">Mean model confidence</div>
+</div>
+""",
         unsafe_allow_html=True,
     )
-
 
 with metric_columns[2]:
-
     st.markdown(
         f"""
-        <div class="metric-card">
-
-        <div class="metric-title">
-            Highest Confidence
-        </div>
-
-        <div class="metric-value">
-            {highest_confidence:.1%}
-        </div>
-
-        <div class="metric-description">
-            Strongest detection
-        </div>
-
-        </div>
-        """,
+<div class="metric-card">
+    <div class="metric-title">Highest Confidence</div>
+    <div class="metric-value">{highest_confidence:.1%}</div>
+    <div class="metric-description">Strongest detection</div>
+</div>
+""",
         unsafe_allow_html=True,
     )
-
 
 with metric_columns[3]:
-
     st.markdown(
         f"""
-        <div class="metric-card">
-
-        <div class="metric-title">
-            Image Resolution
-        </div>
-
-        <div class="metric-value">
-            {image_width}×{image_height}
-        </div>
-
-        <div class="metric-description">
-            Uploaded image dimensions
-        </div>
-
-        </div>
-        """,
+<div class="metric-card">
+    <div class="metric-title">Image Resolution</div>
+    <div class="metric-value">{image_width}×{image_height}</div>
+    <div class="metric-description">Uploaded image size</div>
+</div>
+""",
         unsafe_allow_html=True,
     )
 
 
 # ============================================================
-# CREATE ANNOTATED IMAGE
+# ANNOTATED IMAGE
 # ============================================================
 
+annotated_image = analysis_image.copy()
+draw = ImageDraw.Draw(annotated_image)
+
 try:
-
-    annotated_array = annotate_image(
-        image=np.asarray(
-            analysis_image
-        ),
-        detections=detections,
-    )
-
-    annotated_image = Image.fromarray(
-        annotated_array
-    )
-
+    font = ImageFont.load_default()
 except Exception:
+    font = None
 
-    # --------------------------------------------------------
-    # PIL fallback annotation
-    # --------------------------------------------------------
 
-    annotated_image = analysis_image.copy()
+for detection in detections:
+    bbox = detection["bbox"]
 
-    draw = ImageDraw.Draw(
-        annotated_image
+    x1 = int(bbox["x1"])
+    y1 = int(bbox["y1"])
+    x2 = int(bbox["x2"])
+    y2 = int(bbox["y2"])
+
+    class_name = detection["class_name"]
+    confidence = float(detection["confidence"])
+
+    label = f"{class_name} {confidence:.2f}"
+
+    draw.rectangle(
+        [x1, y1, x2, y2],
+        outline="red",
+        width=4,
     )
 
     try:
-
-        font = ImageFont.load_default()
-
-    except Exception:
-
-        font = None
-
-    for detection in detections:
-
-        bbox = detection.get(
-            "bbox",
-            {},
-        )
-
-        x1 = int(
-            bbox.get("x1", 0)
-        )
-
-        y1 = int(
-            bbox.get("y1", 0)
-        )
-
-        x2 = int(
-            bbox.get("x2", 0)
-        )
-
-        y2 = int(
-            bbox.get("y2", 0)
-        )
-
-        label = (
-            f"{detection.get('class_name', 'Unknown')} "
-            f"{float(detection.get('confidence', 0)):.2f}"
-        )
-
-        draw.rectangle(
-            [
-                x1,
-                y1,
-                x2,
-                y2,
-            ],
-            outline="red",
-            width=4,
-        )
-
-        draw.text(
-            [
-                x1,
-                max(0, y1 - 18),
-            ],
+        text_box = draw.textbbox(
+            (x1, y1),
             label,
-            fill="red",
             font=font,
         )
+        text_width = text_box[2] - text_box[0]
+        text_height = text_box[3] - text_box[1]
+    except Exception:
+        text_width = len(label) * 7
+        text_height = 14
+
+    label_y = max(0, y1 - text_height - 6)
+
+    draw.rectangle(
+        [
+            x1,
+            label_y,
+            x1 + text_width + 8,
+            label_y + text_height + 6,
+        ],
+        fill="red",
+    )
+
+    draw.text(
+        [x1 + 4, label_y + 3],
+        label,
+        fill="white",
+        font=font,
+    )
 
 
 # ============================================================
-# IMAGE DISPLAY
+# IMAGE RESULTS
 # ============================================================
 
-st.markdown(
-    "## 🖼️ Detection Result"
-)
+st.header("🖼️ Detection Result")
 
 image_col1, image_col2 = st.columns(2)
 
-
 with image_col1:
-
-    st.markdown(
-        "### Original Image"
-    )
-
+    st.subheader("Original Image")
     st.image(
         analysis_image,
         use_container_width=True,
     )
 
-
 with image_col2:
-
-    st.markdown(
-        "### AI Detection"
-    )
-
+    st.subheader("AI Detection")
     st.image(
         annotated_image,
         use_container_width=True,
@@ -1126,22 +642,21 @@ with image_col2:
 
 
 # ============================================================
-# SEVERITY ENGINE
+# SEVERITY CALCULATION
 # ============================================================
 
 def calculate_severity(
-    detections: List[Dict[str, Any]]
-) -> Dict[str, Any]:
+    detections_list: list[dict[str, Any]],
+    width: int,
+    height: int,
+) -> dict[str, Any]:
     """
-    Calculate an interpretable RoadGuard severity assessment.
+    Calculate an application-level visual risk indicator.
 
-    This is an application-level assessment intended for
-    prioritization and demonstration. It is not a structural
-    engineering diagnosis.
+    This is not a structural engineering diagnosis.
     """
 
-    if not detections:
-
+    if not detections_list:
         return {
             "severity": "Low",
             "risk_score": 0,
@@ -1152,157 +667,65 @@ def calculate_severity(
             ),
         }
 
-    # --------------------------------------------------------
-    # Base severity weights
-    # --------------------------------------------------------
-
-    class_weights = {
-        "Longitudinal Crack": 25,
-        "Transverse Crack": 25,
-        "Alligator Crack": 35,
-        "Other Corruption": 20,
-        "Pothole": 40,
-    }
-
+    image_area = max(1, width * height)
     weighted_scores = []
 
-    for detection in detections:
+    for detection in detections_list:
+        class_name = detection["class_name"]
+        confidence = float(detection["confidence"])
+        area = float(detection["area"])
 
-        class_name = detection.get(
-            "class_name",
-            "Unknown",
-        )
+        # Match known names first. If a custom model name is used,
+        # use a conservative default weight.
+        base_weight = CLASS_WEIGHTS.get(class_name, 20)
 
-        confidence = float(
-            detection.get(
-                "confidence",
-                0,
-            )
-        )
+        confidence_score = base_weight * confidence
 
-        area = float(
-            detection.get(
-                "area",
-                0,
-            )
-        )
-
-        # ----------------------------------------------------
-        # Confidence contribution
-        # ----------------------------------------------------
-
-        base_weight = class_weights.get(
-            class_name,
-            20,
-        )
-
-        confidence_score = (
-            base_weight
-            * confidence
-        )
-
-        # ----------------------------------------------------
-        # Bounding box area contribution
-        # ----------------------------------------------------
-
-        image_area = (
-            image_width
-            * image_height
-        )
-
-        if image_area > 0:
-
-            area_ratio = (
-                area / image_area
-            )
-
-        else:
-
-            area_ratio = 0.0
-
-        # Cap area contribution to avoid
-        # extremely large scores.
-        area_bonus = min(
-            area_ratio * 100,
-            20,
-        )
-
-        detection_score = (
-            confidence_score
-            + area_bonus
-        )
+        area_ratio = area / image_area
+        area_bonus = min(area_ratio * 100.0, 20.0)
 
         weighted_scores.append(
-            detection_score
+            confidence_score + area_bonus
         )
 
-    # --------------------------------------------------------
-    # Aggregate risk
-    # --------------------------------------------------------
+    raw_score = sum(weighted_scores)
 
-    raw_score = sum(
-        weighted_scores
-    )
-
-    # Multiple detections increase urgency.
     count_bonus = min(
-        len(detections) * 5,
+        len(detections_list) * 5,
         25,
     )
 
     risk_score = min(
         100,
-        int(
-            raw_score
-            + count_bonus
-        ),
+        int(raw_score + count_bonus),
     )
 
-    # --------------------------------------------------------
-    # Severity level
-    # --------------------------------------------------------
-
     if risk_score >= 75:
-
         severity = "Critical"
         priority = "Immediate Intervention"
-
         recommendation = (
-            "Multiple or high-impact road defects were detected. "
-            "The affected area should receive prompt field "
-            "inspection and maintenance planning."
+            "High-impact visual road-damage indicators were detected. "
+            "Prompt field inspection and maintenance planning are recommended."
         )
-
     elif risk_score >= 50:
-
         severity = "High"
         priority = "High Priority"
-
         recommendation = (
-            "Significant road damage was detected. "
-            "A field inspection and maintenance assessment "
-            "should be scheduled soon."
+            "Significant visual road-damage indicators were detected. "
+            "A field inspection and maintenance assessment should be scheduled."
         )
-
     elif risk_score >= 25:
-
         severity = "Medium"
         priority = "Planned Maintenance"
-
         recommendation = (
-            "Moderate road damage was detected. "
-            "The location should be monitored and considered "
-            "for planned maintenance."
+            "Moderate visual road-damage indicators were detected. "
+            "The location should be monitored and considered for planned maintenance."
         )
-
     else:
-
         severity = "Low"
         priority = "Routine Inspection"
-
         recommendation = (
-            "Detected damage appears limited according to "
-            "the current image and confidence threshold. "
+            "Limited visual road-damage indicators were detected. "
             "Routine monitoring is recommended."
         )
 
@@ -1314,249 +737,95 @@ def calculate_severity(
     }
 
 
-# ============================================================
-# RUN SEVERITY ANALYSIS
-# ============================================================
-
 severity_result = calculate_severity(
-    detections
+    detections,
+    image_width,
+    image_height,
 )
 
-
-severity_level = severity_result[
-    "severity"
-]
-
-risk_score = severity_result[
-    "risk_score"
-]
-
-priority = severity_result[
-    "priority"
-]
-
-recommendation = severity_result[
-    "recommendation"
-]
+severity_level = severity_result["severity"]
+risk_score = int(severity_result["risk_score"])
+priority = severity_result["priority"]
+recommendation = severity_result["recommendation"]
 
 
 # ============================================================
-# SEVERITY DISPLAY
+# RISK ASSESSMENT
 # ============================================================
 
-st.markdown(
-    "## 🚦 Infrastructure Risk Assessment"
+st.header("🚦 Infrastructure Risk Assessment")
+
+st.metric(
+    "Risk Score",
+    f"{risk_score}/100",
 )
 
-
-severity_css_class = {
-    "Critical": "severity-critical",
-    "High": "severity-high",
-    "Medium": "severity-medium",
-    "Low": "severity-low",
-}.get(
-    severity_level,
-    "severity-low",
-)
-
-
-severity_description = {
-    "Critical": (
-        "Very high-priority road damage indicators "
-        "were detected."
-    ),
-    "High": (
-        "Substantial road damage indicators "
-        "were detected."
-    ),
-    "Medium": (
-        "Moderate road damage indicators "
-        "were detected."
-    ),
-    "Low": (
-        "Limited road damage indicators "
-        "were detected."
-    ),
-}.get(
-    severity_level,
-    "Road condition assessment completed.",
-)
-
-
-st.markdown(
-    f"""
-    <div class="severity-card {severity_css_class}">
-
-        <div class="severity-title">
-            {severity_level} Severity
-        </div>
-
-        <div style="
-            font-size:32px;
-            font-weight:800;
-            margin-top:8px;
-        ">
-            Risk Score: {risk_score}/100
-        </div>
-
-        <div class="severity-text">
-            {severity_description}
-        </div>
-
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-risk_col1, risk_col2, risk_col3 = st.columns(3)
-
+risk_col1, risk_col2 = st.columns(2)
 
 with risk_col1:
-
-    st.metric(
-        "Severity",
-        severity_level,
-    )
-
+    st.metric("Severity", severity_level)
 
 with risk_col2:
+    st.metric("Maintenance Priority", priority)
 
-    st.metric(
-        "Risk Score",
-        f"{risk_score}/100",
+if severity_level == "Critical":
+    st.error(
+        f"**{severity_level} Severity** — {recommendation}"
     )
-
-
-with risk_col3:
-
-    st.metric(
-        "Maintenance Priority",
-        priority,
+elif severity_level == "High":
+    st.warning(
+        f"**{severity_level} Severity** — {recommendation}"
     )
-
-
-st.markdown(
-    f"""
-    <div class="info-box">
-
-    <strong>Recommended Action</strong>
-
-    <br><br>
-
-    {recommendation}
-
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+elif severity_level == "Medium":
+    st.info(
+        f"**{severity_level} Severity** — {recommendation}"
+    )
+else:
+    st.success(
+        f"**{severity_level} Severity** — {recommendation}"
+    )
 
 
 # ============================================================
 # DETECTION TABLE
 # ============================================================
 
-st.markdown(
-    "## 🔎 Detailed Detections"
-)
-
+st.header("🔎 Detailed Detections")
 
 if detections:
-
     table_rows = []
 
     for index, detection in enumerate(
         detections,
         start=1,
     ):
-
-        bbox = detection.get(
-            "bbox",
-            {},
-        )
+        bbox = detection["bbox"]
 
         table_rows.append(
             {
                 "Detection": index,
-
-                "Damage Type": detection.get(
-                    "class_name",
-                    "Unknown",
-                ),
-
+                "Damage Type": detection["class_name"],
                 "Confidence": (
-                    f"{float(detection.get('confidence', 0)):.2%}"
+                    f'{float(detection["confidence"]):.2%}'
                 ),
-
-                "X1": round(
-                    float(
-                        bbox.get(
-                            "x1",
-                            0,
-                        )
-                    ),
-                    1,
-                ),
-
-                "Y1": round(
-                    float(
-                        bbox.get(
-                            "y1",
-                            0,
-                        )
-                    ),
-                    1,
-                ),
-
-                "X2": round(
-                    float(
-                        bbox.get(
-                            "x2",
-                            0,
-                        )
-                    ),
-                    1,
-                ),
-
-                "Y2": round(
-                    float(
-                        bbox.get(
-                            "y2",
-                            0,
-                        )
-                    ),
-                    1,
-                ),
-
-                "Area": round(
-                    float(
-                        detection.get(
-                            "area",
-                            0,
-                        )
-                    ),
-                    1,
-                ),
+                "X1": round(float(bbox["x1"]), 1),
+                "Y1": round(float(bbox["y1"]), 1),
+                "X2": round(float(bbox["x2"]), 1),
+                "Y2": round(float(bbox["y2"]), 1),
+                "Area": round(float(detection["area"]), 1),
             }
         )
 
-    detection_dataframe = pd.DataFrame(
-        table_rows
-    )
+    detection_dataframe = pd.DataFrame(table_rows)
 
     st.dataframe(
         detection_dataframe,
         use_container_width=True,
         hide_index=True,
     )
-
 else:
-
     st.info(
-        """
-        No road damage was detected above the selected
-        confidence threshold.
-        """
+        "No road damage was detected above the selected confidence threshold."
     )
 
 
@@ -1564,285 +833,139 @@ else:
 # DAMAGE DISTRIBUTION
 # ============================================================
 
-st.markdown(
-    "## 📈 Damage Distribution"
-)
-
+st.header("📈 Damage Distribution")
 
 if detections:
-
-    class_counts = {}
+    class_counts: dict[str, int] = {}
 
     for detection in detections:
-
-        class_name = detection.get(
-            "class_name",
-            "Unknown",
-        )
-
-        class_counts[class_name] = (
-            class_counts.get(
-                class_name,
-                0,
-            )
-            + 1
-        )
+        name = detection["class_name"]
+        class_counts[name] = class_counts.get(name, 0) + 1
 
     chart_dataframe = pd.DataFrame(
         {
-            "Damage Type": list(
-                class_counts.keys()
-            ),
-            "Detections": list(
-                class_counts.values()
-            ),
+            "Damage Type": list(class_counts.keys()),
+            "Detections": list(class_counts.values()),
         }
-    )
+    ).set_index("Damage Type")
 
-    chart_dataframe = (
-        chart_dataframe
-        .set_index(
-            "Damage Type"
-        )
-    )
-
-    st.bar_chart(
-        chart_dataframe
-    )
-
+    st.bar_chart(chart_dataframe)
 else:
-
-    st.info(
-        "No detection distribution is available."
-    )
+    st.info("No detection distribution is available.")
 
 
 # ============================================================
-# CLASS-BY-CLASS SUMMARY
+# CLASS ANALYSIS
 # ============================================================
 
-st.markdown(
-    "## 🧩 Class Analysis"
-)
+st.header("🧩 Class Analysis")
 
+class_columns = st.columns(len(CLASS_NAMES))
 
-class_columns = st.columns(
-    len(CLASS_NAMES)
-)
-
-
-for index, (
-    class_id,
-    class_name,
-) in enumerate(
-    CLASS_NAMES.items()
-):
-
+for index, class_name in CLASS_NAMES.items():
     count = sum(
         1
         for detection in detections
-        if int(
-            detection.get(
-                "class_id",
-                -1,
-            )
-        ) == class_id
+        if int(detection["class_id"]) == index
     )
 
     with class_columns[index]:
-
-        st.markdown(
-            f"""
-            <div class="metric-card">
-
-            <div class="metric-title">
-                Class {class_id}
-            </div>
-
-            <div style="
-                font-size:15px;
-                font-weight:700;
-                margin-bottom:10px;
-            ">
-                {class_name}
-            </div>
-
-            <div class="metric-value">
-                {count}
-            </div>
-
-            <div class="metric-description">
-                detections
-            </div>
-
-            </div>
-            """,
-            unsafe_allow_html=True,
+        st.metric(
+            class_name,
+            count,
         )
 
 
 # ============================================================
-# REPORT GENERATION
+# JSON REPORT
 # ============================================================
 
-st.markdown(
-    "## 📄 Analysis Report"
-)
-
+st.header("📄 Analysis Report")
 
 report = {
     "project": "RoadGuard Infrastructure Intelligence",
-
     "dataset": "RDD2022",
-
     "model": "YOLOv8n",
-
     "analysis_time": st.session_state.get(
         "roadguard_analysis_time",
         datetime.now().isoformat(),
     ),
-
     "image": {
         "filename": filename,
         "width": image_width,
         "height": image_height,
     },
-
     "settings": {
         "confidence_threshold": confidence_threshold,
         "iou_threshold": iou_threshold,
         "image_size": image_size,
     },
-
     "summary": {
         "total_detections": total_detections,
         "average_confidence": average_confidence,
         "highest_confidence": highest_confidence,
     },
-
     "severity": {
         "level": severity_level,
         "risk_score": risk_score,
         "priority": priority,
         "recommendation": recommendation,
     },
-
     "detections": detections,
 }
 
 
-# ============================================================
-# JSON DOWNLOAD
-# ============================================================
-
 json_data = json.dumps(
     report,
     indent=4,
-    default=str,
+    ensure_ascii=False,
 )
 
 
-st.download_button(
-    label="📥 Download JSON Report",
-    data=json_data,
-    file_name="roadguard_analysis_report.json",
-    mime="application/json",
-    use_container_width=True,
-)
+download_col1, download_col2 = st.columns(2)
+
+with download_col1:
+    st.download_button(
+        "📥 Download JSON Report",
+        data=json_data,
+        file_name="roadguard_analysis_report.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+with download_col2:
+    image_buffer = io.BytesIO()
+
+    annotated_image.save(
+        image_buffer,
+        format="PNG",
+    )
+
+    image_buffer.seek(0)
+
+    st.download_button(
+        "🖼️ Download Annotated Image",
+        data=image_buffer,
+        file_name="roadguard_annotated.png",
+        mime="image/png",
+        use_container_width=True,
+    )
 
 
 # ============================================================
-# ANNOTATED IMAGE DOWNLOAD
-# ============================================================
-
-image_buffer = io.BytesIO()
-
-annotated_image.save(
-    image_buffer,
-    format="PNG",
-)
-
-image_buffer.seek(0)
-
-
-st.download_button(
-    label="🖼️ Download Annotated Image",
-    data=image_buffer,
-    file_name="roadguard_annotated.png",
-    mime="image/png",
-    use_container_width=True,
-)
-
-
-# ============================================================
-# MODEL INFORMATION
-# ============================================================
-
-with st.expander(
-    "🤖 Model Information"
-):
-
-    if get_model_info is not None:
-
-        try:
-
-            model_info = get_model_info(
-                MODEL_PATH
-            )
-
-            st.json(
-                model_info
-            )
-
-        except Exception:
-
-            st.json(
-                {
-                    "model": "YOLOv8n",
-                    "dataset": "RDD2022",
-                    "model_path": str(
-                        MODEL_PATH
-                    ),
-                    "classes": CLASS_NAMES,
-                }
-            )
-
-    else:
-
-        st.json(
-            {
-                "model": "YOLOv8n",
-                "dataset": "RDD2022",
-                "model_path": str(
-                    MODEL_PATH
-                ),
-                "classes": CLASS_NAMES,
-            }
-        )
-
-
-# ============================================================
-# SEVERITY DISCLAIMER
+# DISCLAIMER
 # ============================================================
 
 st.markdown(
     """
-    <div class="warning-box">
-
-    <strong>⚠️ Important Note</strong>
-
-    <br><br>
-
-    RoadGuard provides computer-vision-based visual
-    assessment and maintenance prioritization.
-
-    The severity and risk score are intended as decision-support
-    indicators and should not be treated as a replacement for
-    professional civil-engineering inspection or structural
-    assessment.
-
-    </div>
-    """,
+<div class="warning-box">
+<strong>⚠️ Important Note</strong><br><br>
+RoadGuard provides computer-vision-based visual assessment
+and maintenance-prioritization indicators. The displayed
+severity and risk score are not a substitute for professional
+civil-engineering inspection or structural assessment.
+</div>
+""",
     unsafe_allow_html=True,
 )
 
@@ -1853,21 +976,13 @@ st.markdown(
 
 st.markdown(
     """
-    <div class="footer">
-
-        <strong>🚧 RoadGuard Infrastructure Intelligence</strong>
-
-        <br><br>
-
-        AI-powered road damage detection using
-        <strong>YOLOv8n</strong> and the
-        <strong>RDD2022</strong> dataset.
-
-        <br><br>
-
-        Computer Vision • Road Safety • Infrastructure Intelligence
-
-    </div>
-    """,
+<div class="footer">
+    <strong>🚧 RoadGuard Infrastructure Intelligence</strong>
+    <br><br>
+    AI-powered road damage detection using YOLOv8n and RDD2022.
+    <br><br>
+    Computer Vision • Road Safety • Infrastructure Intelligence
+</div>
+""",
     unsafe_allow_html=True,
 )
