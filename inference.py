@@ -53,7 +53,11 @@ except ImportError:
 # CONFIGURATION
 # ============================================================
 
-DEFAULT_MODEL = "roadguard_best.pt"
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+
+DEFAULT_MODEL = str(BASE_DIR / "roadguard_best.pt")
 
 # RDD2022 classes used during training.
 CLASS_NAMES = {
